@@ -1,0 +1,31 @@
+# @package _global_
+
+checkpoint: ???
+
+# algo:
+#   config:
+#     network_load_dict:
+#       teacher_actor:
+#         path: ???
+
+algo:
+  config:
+    eval:
+      num_eval_episodes: 150  # number of episodes to evaluate per device; may be overridden by num_save_episodes
+      save_videos: false  # whether to save videos
+      video_save_prob: 1.0
+
+      save_goal_reached_only: true  # whether to only save successful trajectories
+
+      # The following two parameters are about saving trajectories
+      save_trajectories: false
+      num_save_episodes: 200  # number of episodes to save per device; will override num_eval_episodes
+      
+
+eval_timestamp: ${now:%Y%m%d_%H%M%S}
+eval_name: TEST
+eval_base_dir: logs_eval
+eval_log_dir: ${eval_base_dir}/${eval_timestamp}-${eval_name}
+hydra:
+  run:
+    dir: ${eval_log_dir}

@@ -1,0 +1,13 @@
+include LICENSE
+include README.md
+include THIRD_PARTY_NOTICES.md
+include requirements-training.txt
+recursive-include gr00t/rl/config *.yaml
+recursive-include gr00t/rl/data *.usda
+include gr00t/rl/simulator/isaacsim/.isaacsim_version
+recursive-include move_garbage/config *.yaml
+recursive-include move_garbage/data *
+recursive-include models *.pt
+include move_garbage/checkpoints/config.yaml
+include move_garbage/checkpoints/model_step_012900.pt
+

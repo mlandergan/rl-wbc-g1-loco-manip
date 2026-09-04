@@ -1,0 +1,2033 @@
+num_gpus: 1
+max_retries: 1
+seed: 0
+codebase_version: 1.0
+headless: true
+num_envs: 4096
+auto_load_latest: false
+checkpoint: ./move_garbage/checkpoints/model_step_012900.pt
+project_name: g1_bin_push_homie
+experiment_name: stage0_additive_norest_v2_native_plane_gpu3_resume_50k_tb
+base_dir: logs_rl
+timestamp: ${now:%Y%m%d_%H%M%S}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+save_dir: ${experiment_dir}/.hydra
+force_flat_terrain: false
+use_wandb: false
+log_task_name: bin_push
+multi_gpu: false
+global_rank: 0
+sim_type: isaacgym
+env_spacing: 20
+output_dir: ${experiment_dir}/output
+eval_overrides:
+  headless: false
+  num_envs: 1
+  auto_load_latest: false
+  use_wandb: false
+algo:
+  trl:
+    dataset_name: dummy
+    output_dir: logs_rl/g1_bin_push_homie/stage0_additive_norest_v2_native_plane_gpu3_resume_50k_tb-20260820_051545
+    learning_rate: ${algo.config.actor_learning_rate}
+    num_total_batches: 50000
+    total_episodes: null
+    num_ppo_epochs: ${algo.config.num_learning_epochs}
+    num_mini_batches: ${algo.config.num_mini_batches}
+    per_device_train_batch_size: null
+    gradient_accumulation_steps: 1
+    report_to: tensorboard
+    gamma: ${algo.config.gamma}
+    lam: ${algo.config.lam}
+    vf_coef: ${algo.config.value_loss_coef}
+    lr_scheduler_type: constant
+    save_strategy: 'no'
+    disable_tqdm: true
+    logging_dir: ${experiment_dir}/tensorboard
+  config:
+    eval:
+      eval_interval: 0
+      num_eval_episodes: 200
+      save_videos: false
+      video_save_prob: 0.05
+      save_goal_reached_only: false
+      save_trajectories: false
+      num_save_episodes: 200
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.9975
+    lam: 0.985
+    value_loss_coef: 1.0
+    entropy_coef: 0.003
+    actor_learning_rate: 0.0001
+    critic_learning_rate: 0.0001
+    max_grad_norm: 1.0
+    use_clipped_value_loss: true
+    schedule: adaptive
+    desired_kl: 0.005
+    num_steps_per_env: 64
+    save_interval: 50
+    load_optimizer: true
+    init_noise_std: 0.8
+    num_learning_iterations: 1000000
+    init_at_random_ep_len: false
+    eval_callbacks: null
+    global_rank: 0
+    world_size: 1
+    module_dict:
+      actor:
+        input_dim:
+        - actor_obs
+        output_dim:
+        - robot_action_dim
+        layer_config:
+          type: MLP
+          hidden_dims:
+          - 512
+          - 256
+          - 128
+          activation: ELU
+      critic:
+        type: MLP
+        input_dim:
+        - critic_obs
+        output_dim:
+        - 1
+        layer_config:
+          type: MLP
+          hidden_dims:
+          - 512
+          - 256
+          - 128
+          activation: ELU
+    use_new_actor_critic: true
+    use_padding_mask: false
+    ppo_shuffle_every_epoch: true
+    sync_advantage_normalization: true
+    homie_walk_model_path: ./models/model_walk.pt
+    homie_stand_model_path: ./models/model_stand.pt
+    homie_command_dim: 3
+    non_homie_command_actions_dim: 16
+    opt_homie: false
+    max_noise_std: 0.8
+    min_noise_std: 0.1
+    clamp_noise_std: true
+    actor:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentActor
+      running_mean_std: true
+      rnn_type: lstm
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: true
+        module_config_dict:
+          input_dim:
+          - actor_obs
+          output_dim:
+          - ${eval:'${algo.config.homie_command_dim} + ${algo.config.non_homie_command_actions_dim}'}
+          layer_config:
+            type: MLP
+            hidden_dims:
+            - 512
+            - 256
+            - 128
+            activation: SiLU
+    critic:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentCritic
+      running_mean_std: true
+      rnn_type: lstm
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: true
+        module_config_dict:
+          type: MLP
+          input_dim:
+          - critic_obs
+          output_dim:
+          - 1
+          layer_config:
+            type: MLP
+            hidden_dims:
+            - 512
+            - 256
+            - 128
+            activation: SiLU
+env:
+  _target_: move_garbage.envs.bin_push_homie.BinPushHomie
+  _recursive_: false
+  config:
+    experiment_name: ${experiment_name}
+    num_envs: ${num_envs}
+    headless: ${headless}
+    simulator: ${simulator}
+    save_rendering_dir: null
+    experiment_dir: null
+    ckpt_dir: null
+    robot: ${robot}
+    domain_rand: ${domain_rand}
+    rewards: ${rewards}
+    terrain: ${terrain}
+    obs: ${obs}
+    env_spacing: 5.0
+    max_episode_length_s: 20
+    normalization:
+      clip_actions: 100.0
+      clip_observations: 100.0
+    termination:
+      terminate_when_close_to_dof_pos_limit: false
+      terminate_when_close_to_dof_vel_limit: false
+      terminate_when_close_to_torque_limit: false
+      terminate_by_contact: false
+      terminate_by_gravity: false
+      terminate_by_low_height: true
+    termination_scales:
+      termination_close_to_dof_pos_limit: 0.98
+      termination_close_to_dof_vel_limit: 0.98
+      termination_close_to_torque_limit: 0.98
+      termination_gravity_x: 0.5
+      termination_gravity_y: 0.5
+      termination_min_base_height: 0.5
+      termination_contact_force: 10.0
+    noise_to_initial_level: 0
+    init_noise_scale:
+      dof_pos: 0.1
+      dof_vel: 0.15
+      root_pos: 0.05
+      root_rot: 10
+      root_vel: 0.01
+      root_ang_vel: 0.01
+    task:
+      type: manipulation
+      name: bin
+      objects:
+      - bin
+      target_obj: bin
+      thershold: 0.05
+      target_obj_contact_sensor: false
+      target_obj_contact_sub_prim_path: body
+      target_obj_transform_sub_prim_path: grasp_target_left
+      which_hand: any_hand
+    ref_height: 0.75
+    target_bin_push_distance: 1.0
+    push_axis_world:
+    - 1.0
+    - 0.0
+    - 0.0
+    target_root_vel: 0.3
+    bin_tilt_target_deg: 15.0
+    stop_standoff: 0.46
+    stop_transition_along_tolerance: 0.08
+    stop_transition_lateral_tolerance: 0.12
+    stage_advance_require_resting_arms: false
+    stage_advance_arm_tolerance: 0.3
+    maintain_standoff_std: 0.08
+    maintain_standoff_lateral_std: 0.12
+    approach_min_standoff: 0.4
+    approach_too_close_penalty_margin: 0.08
+    min_grasp_standoff: 0.34
+    too_close_penalty_margin: 0.1
+    reach_pos_std: 0.25
+    reach_pos_fine_std: 0.08
+    reach_pos_fine_weight: 0.35
+    reach_pos_std_vert: 0.2
+    reach_pos_fine_std_vert: 0.04
+    reach_pos_fine_weight_vert: 0.5
+    reach_velocity_weight: 0.15
+    reach_finger_gate_floor: 0.25
+    reach_orientation_gate_floor: 0.0
+    reach_horiz_weight: 0.8
+    pregrasp_arc_height: 0.1
+    pregrasp_arc_peak_frac: 0.75
+    pregrasp_blend_dist: 0.3
+    reach_hold_dist: 0.15
+    reach_hold_full_steps: 15
+    grasp_contact_links_required: 1
+    grasp_transition_dist: 0.1
+    grasp_finger_closed_threshold: 0.174533
+    left_palm_contact_axis:
+    - 0.0
+    - -1.0
+    - 0.0
+    right_palm_contact_axis:
+    - 0.0
+    - 1.0
+    - 0.0
+    left_palm_grasp_axis:
+    - 0.9717
+    - -0.2356
+    - -0.0181
+    right_palm_grasp_axis:
+    - 0.9717
+    - 0.2359
+    - 0.0155
+    palm_grasp_point_offset: 0.0464
+    grasp_target_standoff: 0.04
+    grasp_target_height_offset: 0.01
+    reach_transition_alignment_threshold: 0.0
+    grasp_contact_alignment_threshold: 0.0
+    grasp_palm_alignment_threshold: 0.5
+    grasp_transition_hold_steps: 8
+    push_grasp_loss_grace_steps: 10
+    grasp_finger_close_horiz_dist: 0.04
+    grasp_finger_close_vert_dist: 0.03
+    grasp_finger_close_alignment: 0.2
+    grasp_finger_close_max_twist_rad: 1.0472
+    palm_twist_std: 1.2
+    grasp_precontact_open_reward_scale: 0.5
+    reach_transition_hold_steps: 5
+    push_target_vel: 0.3
+    push_velocity_weight: 0.5
+    walk_taper_near: 0.25
+    walk_taper_far: 0.6
+    stop_pos_std: 0.2
+    stop_vel_std: 0.1
+    stop_lat_std: 0.15
+    stop_reward_mode: additive
+    stop_reward_additive_weights:
+    - 0.4
+    - 0.4
+    - 0.2
+    stage_advance_vel: 0.2
+    max_stage_time:
+    - 200
+    - 100
+    - 80
+    - 300
+    award_remaining_time_on_advance: true
+    accumulate_stage_reward: false
+    reset_on_complete: true
+    reset_on_complete_delay: 30.0
+    reset_on_overtime: true
+    stage_reward_scale:
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.5
+    delta_action_indices:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    delta_action_scale: 0.3
+    delta_action_clip: 15.0
+    reset_delta_actions_with_backmap: false
+    left_finger_delta_action_index: 17
+    right_finger_delta_action_index: 18
+    warped_action:
+      indices:
+      - 0
+      - 1
+      - 2
+      k: 0.0
+      s: 0.0
+    enable_staged_reset: true
+    staged_reset_ratios:
+    - 0.4
+    - 0.4
+    - 0.2
+    - 0.0
+    staged_reset_max_samples_per_stage: 200
+    staged_reset_checkpoint_samples_per_stage: 4
+    resting_dof_pos:
+    - -0.1
+    - 0
+    - 0
+    - 0.3
+    - -0.2
+    - 0
+    - -0.1
+    - 0
+    - 0
+    - 0.3
+    - -0.2
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0.261799
+    - 0.174533
+    - 0
+    - 0.261799
+    - 1.5708
+    - 0
+    - 0
+    - 0.261799
+    - -0.174533
+    - 0
+    - 0.261799
+    - -1.5708
+    - 0
+    - 0
+    - -1.0472
+    - -1.0472
+    - 0
+    - 1.0472
+    - 1.0472
+    - 0
+    - -0.523599
+    - -0.523599
+    - 0
+    - 0.523599
+    - 0.523599
+    - 0
+    - 0.523599
+    - -0.523599
+    clip_homie_command: true
+    clip_homie_linvel_x_threshold: 0.5
+    clip_homie_linvel_y_threshold: 0.5
+    clip_homie_angvel_threshold: 0.5
+    clip_homie_lower_height_threshold: 0.15
+    clip_homie_upper_height_threshold: 0.75
+    clip_homie_torso_roll_lower_threshold: -0.5
+    clip_homie_torso_roll_upper_threshold: 0.5
+    clip_homie_torso_pitch_lower_threshold: -0.5
+    clip_homie_torso_pitch_upper_threshold: 0.5
+    clip_homie_torso_yaw_lower_threshold: -0.5
+    clip_homie_torso_yaw_upper_threshold: 0.5
+    homie_command_scale: 0.25
+    termination_curriculum:
+      level_down_ave_goal_reached_rate: 0.5
+      level_up_ave_goal_reached_rate: 0.7
+      degree: -0.0001
+      min_level: 0.1
+      max_level: 1.0
+      initial_level: 1.0
+robot:
+  dof_obs_size: 43
+  number_of_actions: ???
+  self_obs_max_coords: ???
+  num_bodies: 46
+  algo_obs_dim_dict: ???
+  key_bodies: []
+  contact_bodies: []
+  foot_name: ankle_roll_link
+  init_state:
+    pos:
+    - 0.0
+    - 0.0
+    - 0.75
+    rot:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    lin_vel:
+    - 0.0
+    - 0.0
+    - 0.0
+    ang_vel:
+    - 0.0
+    - 0.0
+    - 0.0
+    default_joint_angles:
+      left_hip_pitch_joint: -0.1
+      left_hip_roll_joint: 0.0
+      left_hip_yaw_joint: 0.0
+      left_knee_joint: 0.3
+      left_ankle_pitch_joint: -0.2
+      left_ankle_roll_joint: 0.0
+      right_hip_pitch_joint: -0.1
+      right_hip_roll_joint: 0.0
+      right_hip_yaw_joint: 0.0
+      right_knee_joint: 0.3
+      right_ankle_pitch_joint: -0.2
+      right_ankle_roll_joint: 0.0
+      waist_yaw_joint: 0.0
+      waist_roll_joint: 0.0
+      waist_pitch_joint: 0.0
+      left_shoulder_pitch_joint: 0
+      left_shoulder_roll_joint: 0
+      left_shoulder_yaw_joint: 0.0
+      left_elbow_joint: 0
+      left_wrist_roll_joint: 0
+      left_wrist_pitch_joint: 0.0
+      left_wrist_yaw_joint: 0.0
+      right_shoulder_pitch_joint: 0
+      right_shoulder_roll_joint: 0
+      right_shoulder_yaw_joint: 0.0
+      right_elbow_joint: 0
+      right_wrist_roll_joint: 0
+      right_wrist_pitch_joint: 0.0
+      right_wrist_yaw_joint: 0.0
+      left_hand_index_0_joint: 0.0
+      left_hand_middle_0_joint: -0.0
+      left_hand_thumb_0_joint: 0.0
+      right_hand_index_0_joint: 0.0
+      right_hand_middle_0_joint: 0.0
+      right_hand_thumb_0_joint: 0.0
+      left_hand_index_1_joint: 0.0
+      left_hand_middle_1_joint: 0.0
+      left_hand_thumb_1_joint: 0.0
+      right_hand_index_1_joint: 0.0
+      right_hand_middle_1_joint: 0.0
+      right_hand_thumb_1_joint: -0.0
+      left_hand_thumb_2_joint: 0.0
+      right_hand_thumb_2_joint: 0.0
+  contact_pairs_multiplier: 16
+  num_key_bodies: ${len:${robot.key_bodies}}
+  mimic_small_marker_bodies: null
+  randomize_link_body_names:
+  - pelvis
+  - left_hip_yaw_link
+  - left_hip_roll_link
+  - left_hip_pitch_link
+  - left_knee_link
+  - right_hip_yaw_link
+  - right_hip_roll_link
+  - right_hip_pitch_link
+  - right_knee_link
+  control:
+    control_type: P
+    stiffness:
+      hip_yaw: 150
+      hip_roll: 150
+      hip_pitch: 150
+      knee: 200
+      ankle_pitch: 40
+      ankle_roll: 40
+      waist_yaw: 250
+      waist_roll: 250
+      waist_pitch: 250
+      shoulder_pitch: 100
+      shoulder_roll: 100
+      shoulder_yaw: 40
+      elbow: 40
+      wrist_roll: 20
+      wrist_pitch: 20
+      wrist_yaw: 20
+      hand_index: 0.5
+      hand_middle: 0.5
+      hand_thumb_1: 0.5
+      hand_thumb_2: 0.5
+      hand_thumb_0: 2.0
+    damping:
+      hip_yaw: 2.0
+      hip_roll: 2.0
+      hip_pitch: 2.0
+      knee: 4.0
+      ankle_pitch: 2.0
+      ankle_roll: 2.0
+      waist_yaw: 5.0
+      waist_roll: 5.0
+      waist_pitch: 5.0
+      shoulder_pitch: 5.0
+      shoulder_roll: 5.0
+      shoulder_yaw: 2.0
+      elbow: 2.0
+      wrist_roll: 2.0
+      wrist_pitch: 2.0
+      wrist_yaw: 2.0
+      hand_index: 0.1
+      hand_middle: 0.1
+      hand_thumb_1: 0.1
+      hand_thumb_2: 0.1
+      hand_thumb_0: 0.1
+    action_scale: 0.25
+    isaac_pd_scale: false
+    clamp_actions: 1.0
+    clip_torques: true
+    action_clip_value: 100.0
+  asset:
+    collapse_fixed_joints: true
+    replace_cylinder_with_capsule: true
+    flip_visual_attachments: false
+    armature: 0.001
+    thickness: 0.01
+    max_angular_velocity: 1000.0
+    max_linear_velocity: 1000.0
+    density: 0.001
+    angular_damping: 0.01
+    linear_damping: 0.01
+    disable_gravity: null
+    fix_base_link: false
+    default_dof_drive_mode: 3
+    robot_type: g1_43dof
+    urdf_file: g1/${robot.asset.robot_type}.urdf
+    usd_file: g1/${robot.asset.robot_type}_s3.usda
+    xml_file: g1/${robot.asset.robot_type}.xml
+    asset_root: gr00t/rl/data/robots
+    self_collisions: 0
+    filter_ints: null
+  homie_dof_obs_size: 29
+  actions_dim: 31
+  lower_body_actions_dim: 15
+  upper_body_actions_dim: 28
+  body_keys:
+  - lower_body
+  - upper_body
+  policy_obs_dim: -1
+  critic_obs_dim: -1
+  num_feet: 2
+  right_foot_name: right_ankle_roll_link
+  left_foot_name: left_ankle_roll_link
+  knee_name: knee_link
+  has_torso: true
+  torso_name: torso_link
+  has_upper_body_dof: true
+  dof_names:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  - left_hand_index_0_joint
+  - left_hand_middle_0_joint
+  - left_hand_thumb_0_joint
+  - right_hand_index_0_joint
+  - right_hand_middle_0_joint
+  - right_hand_thumb_0_joint
+  - left_hand_index_1_joint
+  - left_hand_middle_1_joint
+  - left_hand_thumb_1_joint
+  - right_hand_index_1_joint
+  - right_hand_middle_1_joint
+  - right_hand_thumb_1_joint
+  - left_hand_thumb_2_joint
+  - right_hand_thumb_2_joint
+  upper_dof_names:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  - left_hand_index_0_joint
+  - left_hand_middle_0_joint
+  - left_hand_thumb_0_joint
+  - right_hand_index_0_joint
+  - right_hand_middle_0_joint
+  - right_hand_thumb_0_joint
+  - left_hand_index_1_joint
+  - left_hand_middle_1_joint
+  - left_hand_thumb_1_joint
+  - right_hand_index_1_joint
+  - right_hand_middle_1_joint
+  - right_hand_thumb_1_joint
+  - left_hand_thumb_2_joint
+  - right_hand_thumb_2_joint
+  overcurling_dof_names:
+  - right_hand_thumb_1_joint
+  - right_hand_thumb_2_joint
+  - right_hand_middle_0_joint
+  - right_hand_middle_1_joint
+  - right_hand_index_0_joint
+  - right_hand_index_1_joint
+  right_hand_dof_names:
+  - right_hand_thumb_0_joint
+  - right_hand_thumb_1_joint
+  - right_hand_thumb_2_joint
+  - right_hand_middle_0_joint
+  - right_hand_middle_1_joint
+  - right_hand_index_0_joint
+  - right_hand_index_1_joint
+  left_hand_dof_names:
+  - left_hand_thumb_0_joint
+  - left_hand_thumb_1_joint
+  - left_hand_thumb_2_joint
+  - left_hand_middle_0_joint
+  - left_hand_middle_1_joint
+  - left_hand_index_0_joint
+  - left_hand_index_1_joint
+  upper_left_arm_dof_names:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - left_hand_index_0_joint
+  - left_hand_middle_0_joint
+  - left_hand_thumb_0_joint
+  - left_hand_thumb_2_joint
+  upper_right_arm_dof_names:
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  - right_hand_index_0_joint
+  - right_hand_middle_0_joint
+  - right_hand_thumb_0_joint
+  - right_hand_index_1_joint
+  - right_hand_middle_1_joint
+  - right_hand_thumb_1_joint
+  - right_hand_thumb_2_joint
+  thumb_tip_link: right_hand_index_1_link
+  right_hand_palm_link: right_hand_palm_link
+  finger_tip_links:
+  - right_hand_thumb_2_link
+  - right_hand_index_1_link
+  - right_hand_middle_1_link
+  finger_dof_configuration_overcurling:
+  - -1.0472
+  - -1.7453
+  - 1.5708
+  - 1.7453
+  - 1.5708
+  - 1.7453
+  finger_dof_configuration_straight:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  lower_dof_names:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  waist_dof_names:
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  waist_yaw_dof_name: waist_yaw_joint
+  waist_roll_dof_name: waist_roll_joint
+  waist_pitch_dof_name: waist_pitch_joint
+  arm_dof_names:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  left_arm_dof_names:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  right_arm_dof_names:
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+  left_ankle_dof_names:
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  right_ankle_dof_names:
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  knee_dof_names:
+  - left_knee_joint
+  - right_knee_joint
+  dof_pos_lower_limit_list:
+  - -2.5307
+  - -0.5236
+  - -2.7576
+  - -0.087267
+  - -0.87267
+  - -0.2618
+  - -2.5307
+  - -2.9671
+  - -2.7576
+  - -0.087267
+  - -0.87267
+  - -0.2618
+  - -2.618
+  - -0.52
+  - -0.52
+  - -3.0892
+  - -1.5882
+  - -2.618
+  - -1.0472
+  - -1.972222054
+  - -1.61443
+  - -1.61443
+  - -3.0892
+  - -2.2515
+  - -2.618
+  - -1.0472
+  - -1.972222054
+  - -1.61443
+  - -1.61443
+  - -1.5708
+  - -1.5708
+  - -1.0472
+  - 0.0
+  - 0.0
+  - -1.0472
+  - -1.74533
+  - -1.74533
+  - -0.724312
+  - 0.0
+  - 0.0
+  - -1.0472
+  - 0.0
+  - -1.74533
+  dof_pos_upper_limit_list:
+  - 2.8798
+  - 2.9671
+  - 2.7576
+  - 2.8798
+  - 0.5236
+  - 0.2618
+  - 2.8798
+  - 0.5236
+  - 2.7576
+  - 2.8798
+  - 0.5236
+  - 0.2618
+  - 2.618
+  - 0.52
+  - 0.52
+  - 2.6704
+  - 2.2515
+  - 2.618
+  - 2.0944
+  - 1.972222054
+  - 1.61443
+  - 1.61443
+  - 2.6704
+  - 1.5882
+  - 2.618
+  - 2.0944
+  - 1.972222054
+  - 1.61443
+  - 1.61443
+  - 0.0
+  - 0.0
+  - 1.0472
+  - 1.5708
+  - 1.5708
+  - 1.0472
+  - 0.0
+  - 0.0
+  - 1.0472
+  - 1.74533
+  - 1.74533
+  - 0.724312
+  - 1.74533
+  - 0.0
+  dof_pos_humanly_lower_limit_list:
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1.5708
+  - -0.174533
+  - -1000000000.0
+  - -1.5708
+  - -0.523599
+  - -1.7453
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1.5708
+  - -1000000000.0
+  - -1.22173
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  - -1000000000.0
+  dof_pos_humanly_upper_limit_list:
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1.5708
+  - 1000000000.0
+  - 1000000000.0
+  - 2.35619
+  - 1000000000.0
+  - 1.22173
+  - 1.5708
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 2.35619
+  - 0.523599
+  - 1.7453
+  - 1.5708
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  - 1000000000.0
+  dof_vel_limit_list:
+  - 32.0
+  - 20.0
+  - 32.0
+  - 20.0
+  - 30.0
+  - 30.0
+  - 32.0
+  - 20.0
+  - 32.0
+  - 20.0
+  - 30.0
+  - 30.0
+  - 32.0
+  - 30.0
+  - 30.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 22.0
+  - 22.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 37.0
+  - 22.0
+  - 22.0
+  - 12.0
+  - 12.0
+  - 6.857
+  - 12.0
+  - 12.0
+  - 6.857
+  - 12.0
+  - 12.0
+  - 12.0
+  - 12.0
+  - 12.0
+  - 12.0
+  - 12.0
+  - 12.0
+  dof_effort_limit_list:
+  - 88.0
+  - 139.0
+  - 88.0
+  - 139.0
+  - 35.0
+  - 35.0
+  - 88.0
+  - 139.0
+  - 88.0
+  - 139.0
+  - 35.0
+  - 35.0
+  - 88.0
+  - 35.0
+  - 35.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 5.0
+  - 5.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 25.0
+  - 5.0
+  - 5.0
+  - 1.4
+  - 1.4
+  - 2.45
+  - 1.4
+  - 1.4
+  - 2.45
+  - 1.4
+  - 1.4
+  - 1.4
+  - 1.4
+  - 1.4
+  - 1.4
+  - 1.4
+  - 1.4
+  dof_effort_limit_scale: 0.95
+  dof_armature_list:
+  - 0.01017752004
+  - 0.025101925
+  - 0.01017752004
+  - 0.025101925
+  - 0.00721945
+  - 0.00721945
+  - 0.01017752004
+  - 0.025101925
+  - 0.01017752004
+  - 0.025101925
+  - 0.00721945
+  - 0.00721945
+  - 0.01017752004
+  - 0.00721945
+  - 0.00721945
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.00425
+  - 0.00425
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.003609725
+  - 0.00425
+  - 0.00425
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  - 0.01
+  dof_joint_friction_list:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  finger_primitive:
+    num_non_primitive_dof: 29
+    primitive_action_map:
+      left:
+        dof_names:
+        - left_hand_index_0_joint
+        - left_hand_middle_0_joint
+        - left_hand_thumb_0_joint
+        - left_hand_index_1_joint
+        - left_hand_middle_1_joint
+        - left_hand_thumb_1_joint
+        - left_hand_thumb_2_joint
+        pos_0:
+        - -1.0472
+        - -1.0472
+        - 0.0
+        - -0.523599
+        - -0.523599
+        - -0.523599
+        - 0.523599
+        pos_1:
+        - -1.5708
+        - -1.5708
+        - 0.0
+        - -1.5708
+        - -1.5708
+        - 0.785398
+        - 1.5708
+        inheritrange: 1.0
+        mode: linear
+      right:
+        dof_names:
+        - right_hand_index_0_joint
+        - right_hand_middle_0_joint
+        - right_hand_thumb_0_joint
+        - right_hand_index_1_joint
+        - right_hand_middle_1_joint
+        - right_hand_thumb_1_joint
+        - right_hand_thumb_2_joint
+        pos_0:
+        - 1.0472
+        - 1.0472
+        - 0.0
+        - 0.523599
+        - 0.523599
+        - 0.523599
+        - -0.523599
+        pos_1:
+        - 1.5708
+        - 1.5708
+        - 0.0
+        - 1.5708
+        - 1.5708
+        - -0.785398
+        - -1.5708
+        inheritrange: 1.0
+        mode: linear
+  body_names:
+  - pelvis
+  - left_hip_pitch_link
+  - right_hip_pitch_link
+  - waist_yaw_link
+  - left_hip_roll_link
+  - right_hip_roll_link
+  - waist_roll_link
+  - left_hip_yaw_link
+  - right_hip_yaw_link
+  - torso_link
+  - left_knee_link
+  - right_knee_link
+  - left_shoulder_pitch_link
+  - right_shoulder_pitch_link
+  - left_ankle_pitch_link
+  - right_ankle_pitch_link
+  - left_shoulder_roll_link
+  - right_shoulder_roll_link
+  - left_ankle_roll_link
+  - right_ankle_roll_link
+  - left_shoulder_yaw_link
+  - right_shoulder_yaw_link
+  - left_elbow_link
+  - right_elbow_link
+  - left_wrist_roll_link
+  - right_wrist_roll_link
+  - left_wrist_pitch_link
+  - right_wrist_pitch_link
+  - left_wrist_yaw_link
+  - right_wrist_yaw_link
+  - left_hand_palm_link
+  - right_hand_palm_link
+  - left_hand_index_0_link
+  - left_hand_middle_0_link
+  - left_hand_thumb_0_link
+  - right_hand_index_0_link
+  - right_hand_middle_0_link
+  - right_hand_thumb_0_link
+  - left_hand_index_1_link
+  - left_hand_middle_1_link
+  - left_hand_thumb_1_link
+  - right_hand_index_1_link
+  - right_hand_middle_1_link
+  - right_hand_thumb_1_link
+  - left_hand_thumb_2_link
+  - right_hand_thumb_2_link
+  arm_body_names:
+  - left_shoulder_pitch_link
+  - right_shoulder_pitch_link
+  - left_ankle_pitch_link
+  - right_ankle_pitch_link
+  - left_shoulder_roll_link
+  - right_shoulder_roll_link
+  - left_ankle_roll_link
+  - right_ankle_roll_link
+  - left_shoulder_yaw_link
+  - right_shoulder_yaw_link
+  - left_elbow_link
+  - right_elbow_link
+  - left_wrist_roll_link
+  - right_wrist_roll_link
+  - left_wrist_pitch_link
+  - right_wrist_pitch_link
+  - left_wrist_yaw_link
+  - right_wrist_yaw_link
+  - left_hand_palm_link
+  - right_hand_palm_link
+  left_hand_body_names:
+  - left_hand_palm_link
+  - left_hand_index_0_link
+  - left_hand_middle_0_link
+  - left_hand_thumb_0_link
+  - left_hand_index_1_link
+  - left_hand_middle_1_link
+  - left_hand_thumb_1_link
+  - left_hand_thumb_2_link
+  right_hand_body_names:
+  - right_hand_palm_link
+  - right_hand_index_0_link
+  - right_hand_middle_0_link
+  - right_hand_thumb_0_link
+  - right_hand_index_1_link
+  - right_hand_middle_1_link
+  - right_hand_thumb_1_link
+  - right_hand_thumb_2_link
+  right_fingers_palm_body_names:
+  - right_hand_thumb_2_link
+  - right_hand_index_1_link
+  - right_hand_middle_1_link
+  - right_hand_palm_link
+  left_hand_palm_side_direction:
+  - -y
+  - -y
+  - -y
+  - +x
+  - -y
+  - -y
+  - +x
+  - +x
+  right_hand_palm_side_direction:
+  - +y
+  - +y
+  - +y
+  - +x
+  - +y
+  - +y
+  - +x
+  - +x
+  terminate_after_contacts_on:
+  - head
+  - knee
+  - wrist
+  penalize_contacts_on:
+  - pelvis
+  - shoulder
+  - hip
+  use_primitive: true
+  check_action_dim: false
+terrain:
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0
+  mesh_type: plane
+  horizontal_scale: 0.1
+  vertical_scale: 0.005
+  border_size: 40
+  curriculum: false
+  measure_heights: false
+  measured_points_x:
+  - 0.0
+  measured_points_y:
+  - 0.0
+  selected: false
+  terrain_kwargs: null
+  max_init_terrain_level: 9
+  terrain_length: 8.0
+  terrain_width: 8.0
+  num_rows: 10
+  num_cols: 20
+  terrain_types:
+  - flat
+  - rough
+  - low_obst
+  - smooth_slope
+  - rough_slope
+  terrain_proportions:
+  - 0.2
+  - 0.6
+  - 0.2
+  - 0.0
+  - 0.0
+  slope_treshold: 0.75
+callbacks:
+  model_save:
+    _target_: gr00t.rl.trl.callbacks.model_save_callback.ModelSaveCallback
+    save_dir: ${experiment_dir}
+    save_frequency: 100
+  wandb:
+    _target_: gr00t.rl.trl.callbacks.wandb_callback.WandbCallback
+trainer:
+  _target_: gr00t.rl.trl.trainer.ppo_trainer_homie_api.TRLPPOTrainer
+wandb:
+  wandb_project: null
+  wandb_tags: online
+  wandb_group: null
+  wandb_id: null
+  wandb_entity: null
+  wandb_dir: ${experiment_dir}/.wandb
+simulator:
+  _target_: gr00t.rl.simulator.isaacsim.isaacsim.IsaacSim
+  _recursive_: false
+  config:
+    name: isaacsim
+    render_results: false
+    terrain: ${terrain}
+    plane:
+      static_friction: 1.0
+      dynamic_friction: 1.0
+      restitution: 0.0
+    sim:
+      fps: 200
+      control_decimation: 4
+      substeps: 1
+      physx:
+        num_threads: 10
+        solver_type: 1
+        num_position_iterations: 8
+        num_velocity_iterations: 4
+        contact_offset: 0.01
+        rest_offset: 0.0
+        bounce_threshold_velocity: 0.5
+        max_depenetration_velocity: 1.0
+        default_buffer_size_multiplier: 5
+        contact_collection: 2
+      render_mode: human
+      render_interval: 1
+    cameras:
+      enable_cameras: false
+      camera_attached_link: d435_link
+      camera_pos_offset:
+      - 0.0
+      - 0.035
+      - 0.0
+      camera_rot_offset:
+      - 0.99955
+      - 0.0
+      - 0.0299955
+      - 0.0
+      camera_yaw_only: true
+      camera_focal_length: 1.88
+      camera_focus_distance: 0.5
+      camera_horizontal_aperture: 2.6035
+      camera_vertical_aperture: 1.4621
+      camera_clipping_range: (0.1, 20.0)
+      camera_types:
+      - rgb: true
+      - depth: false
+      camera_resolutions:
+      - 240
+      - 426
+      image_mean:
+      - 0.485
+      - 0.456
+      - 0.406
+      image_std:
+      - 0.229
+      - 0.224
+      - 0.225
+    heightmap:
+      enable_heightmap: false
+      resolution: 9
+      grid_size: 1.6
+    scene:
+      num_envs: ${num_envs}
+      env_spacing: 20.0
+      replicate_physics: false
+    actuators:
+      actuation_mode: idealpd
+domain_rand:
+  push_robots: false
+  push_interval_s:
+  - 5
+  - 10
+  max_push_vel_xy: 1.0
+  randomize_base_com: false
+  base_com_range:
+    x:
+    - -0.1
+    - 0.1
+    'y':
+    - -0.1
+    - 0.1
+    z:
+    - -0.01
+    - 0.01
+  randomize_link_mass: false
+  link_mass_range:
+  - 0.7
+  - 1.3
+  randomize_pd_gain: false
+  kp_range:
+  - 0.75
+  - 1.25
+  kd_range:
+  - 0.75
+  - 1.25
+  randomize_friction: false
+  friction_range:
+  - -0.6
+  - 1.2
+  randomize_base_mass: false
+  randomize_torque_rfi: false
+  rfi_lim: 0.1
+  randomize_rfi_lim: false
+  rfi_lim_range:
+  - 0.5
+  - 1.5
+  randomize_ctrl_delay: false
+  ctrl_delay_step_range:
+  - 0
+  - 2
+  wsdpt_push: false
+  wsdpt_push_interval_s:
+  - 4
+  - 6
+  wsdpt_palm_push_force_range: 10.0
+  wsdpt_torso_push_force_range: 30.0
+  added_mass_range:
+  - -5.0
+  - 10.0
+  randomize_initial_dof_pos: false
+  initial_dof_pos_range:
+  - -0.1
+  - 0.1
+  initial_dof_pos_distribution: uniform
+  randomize_initial_dof_vel: false
+  initial_dof_vel_range:
+  - -0.5
+  - 0.5
+  initial_dof_vel_distribution: uniform
+  dof_pos_randomization_curriculum: false
+  dof_pos_randomization_initial_range:
+  - -0.02
+  - 0.02
+  dof_pos_randomization_max_range:
+  - -0.1
+  - 0.1
+  dof_pos_randomization_min_range:
+  - -0.005
+  - 0.005
+  dof_pos_randomization_level_down_threshold: 200
+  dof_pos_randomization_level_up_threshold: 400
+  dof_pos_vel_randomization_curriculum_degree: 0.05
+  dof_vel_randomization_curriculum: false
+  dof_vel_randomization_initial_range:
+  - -0.1
+  - 0.1
+  dof_vel_randomization_max_range:
+  - -0.5
+  - 0.5
+  dof_vel_randomization_min_range:
+  - -0.02
+  - 0.02
+  dof_vel_randomization_level_down_threshold: 200
+  dof_vel_randomization_level_up_threshold: 400
+  dof_vel_randomization_curriculum_degree: 0.05
+  randomize_link_body_names:
+  - pelvis
+  - left_hip_yaw_link
+  - left_hip_roll_link
+  - left_hip_pitch_link
+  - left_knee_link
+  - right_hip_yaw_link
+  - right_hip_roll_link
+  - right_hip_pitch_link
+  - right_knee_link
+  randomize_init_pos: false
+  init_pos_range_x:
+  - -0.1
+  - 0.1
+  init_pos_range_y:
+  - -0.075
+  - 0.075
+  init_pos_range_z:
+  - -0.075
+  - 0.075
+  randomize_motion_ref_xyz: false
+  motion_ref_xyz_range:
+  - - -0.02
+    - 0.02
+  - - -0.02
+    - 0.02
+  - - -0.1
+    - 0.1
+  motion_package_loss: false
+  package_loss_range:
+  - 1
+  - 10
+  package_loss_interval_s: 2
+  born_offset: false
+  born_offset_curriculum: false
+  born_offset_level_down_threshold: 50
+  born_offset_level_up_threshold: 120
+  level_degree: 5.0e-05
+  born_distance: 0.25
+  born_offset_range:
+  - 0.0
+  - 1
+  born_offset_possibility: 1.0
+  born_heading_curriculum: false
+  born_heading_randomization: false
+  born_heading_level_down_threshold: 50
+  born_heading_level_up_threshold: 120
+  born_heading_degree: 10
+  born_heading_range:
+  - 0
+  - 180
+  born_heading_level_degree: 5.0e-05
+  image_augmentation:
+    enabled: false
+    brightness:
+      enabled: false
+      probability: 0.25
+      range:
+      - 0.7
+      - 2
+    contrast:
+      enabled: false
+      probability: 0.25
+      range:
+      - 0.5
+      - 1.5
+    hue:
+      enabled: false
+      probability: 0.5
+      range:
+      - -0.1
+      - 0.1
+    saturation:
+      enabled: false
+      probability: 0.25
+      range:
+      - 0.5
+      - 2
+    gaussian_noise:
+      enabled: false
+      probability: 0.25
+      std_range:
+      - 0.0
+      - 0.15
+    gaussian_blur:
+      enabled: false
+      probability: 0.25
+      kernel_size_range:
+      - 3
+      - 5
+      sigma_range:
+      - 0.1
+      - 1.5
+  depth_augmentation:
+    enabled: false
+    depth_scaling:
+      enabled: false
+      probability: 0.3
+      scale_range:
+      - 0.8
+      - 1.2
+    depth_noise:
+      enabled: false
+      probability: 0.3
+      gaussian_noise:
+        enabled: true
+        std_range:
+        - 0.001
+        - 0.01
+      perlin_noise:
+        enabled: false
+        scale_range:
+        - 0.1
+        - 0.5
+        amplitude_range:
+        - 0.001
+        - 0.005
+    depth_dropout:
+      enabled: false
+      probability: 0.2
+      patch_dropout:
+        enabled: true
+        num_patches_range:
+        - 1
+        - 5
+        patch_size_range:
+        - 5
+        - 15
+      pixel_dropout:
+        enabled: false
+        dropout_rate_range:
+        - 0.01
+        - 0.05
+    depth_quantization:
+      enabled: false
+      probability: 0.25
+      levels_range:
+      - 32
+      - 256
+  randomize_dome_light: false
+  dome_light_intensity_range:
+  - 800
+  - 2000
+  dome_light_intensity_distribution: uniform
+  dome_light_yaw_range:
+  - -3.142
+  - 3.142
+  dome_light_yaw_distribution: uniform
+  dome_light_texture_folder_paths: []
+  randomize_robot_material: false
+  robot_material_roughness_range:
+  - 0.0
+  - 0.8
+  robot_material_metallic_range:
+  - 0.0
+  - 0.8
+  robot_material_specular_range:
+  - 0.0
+  - 0.8
+  robot_material_distribution: uniform
+  robot_material_shader_prim_paths:
+  - /World/envs/env_0/Robot/Looks/Rubber_Textured/Shader
+  - /World/envs/env_0/Robot/Looks/Marble_Tile_12/Shader
+  randomize_floor_material: false
+  floor_material_folder_paths: []
+  randomize_table_material: false
+  table_material_folder_paths: []
+rewards:
+  set_reward: BinPush
+  set_reward_date: 20260710
+  only_positive_rewards: false
+  reward_scales:
+    penalty_dof_acc: -1.0e-05
+    penalty_dof_vel: -0.001
+    penalty_delta_action_rate: -0.01
+    termination: -1000.0
+    limits_dof_pos: -5.0
+    limits_primitive_action: -1.0
+    walk_to_bin: 5.0
+    stop_at_bin: 8.0
+    penalty_upper_body_non_finger_deviation_l1: -1.0
+    reach_left: 3.0
+    reach_right: 3.0
+    reach_finger_dof_pos_l1: 1.5
+    maintain_standoff: 3.0
+    palm_twist_alignment: 7.0
+    palm_twist_progress: 5.0
+    penalty_too_close_to_bin: -5.0
+    penalty_not_standing_still: -6.0
+    grasp_finger_dof_pos_l1: 3.0
+    grasp_target_distance: 3.0
+    grasp_contact: 5.0
+    grasp_vert_progress: 12.0
+    palm_down_alignment: 2.0
+    penalty_wrong_twist_contact: -2.0
+    push_bin_progress: 16.0
+    maintain_grasp_while_pushing: 2.0
+    step_forward_while_pushing: 4.0
+    penalty_bin_wheel_kick: -0.1
+    penalty_bin_tilt: -1.0
+    penalty_asymmetric_grasp: -0.5
+    stage: 1.0
+    complete: 4.0
+    penalty_humanly_dof_limit: -1.0
+    penalty_undesired_contact: -0.2
+    penalty_dof_overspeed: -0.1
+    penalty_upright: -1.0
+    penalty_homie_action_limit: -1.0
+    penalty_face_bin: -3.0
+  reward_limit:
+    soft_dof_pos_limit: 0.95
+    soft_dof_vel_limit: 0.95
+    soft_torque_limit: 0.9
+    reward_limits_curriculum:
+      soft_dof_pos_curriculum: false
+      soft_dof_pos_initial_limit: 1.15
+      soft_dof_pos_max_limit: 1.15
+      soft_dof_pos_min_limit: 0.95
+      soft_dof_pos_curriculum_degree: 2.5e-07
+      soft_dof_pos_curriculum_level_down_threshold: 40
+      soft_dof_pos_curriculum_level_up_threshold: 42
+      soft_dof_vel_curriculum: false
+      soft_dof_vel_initial_limit: 1.15
+      soft_dof_vel_max_limit: 1.25
+      soft_dof_vel_min_limit: 0.95
+      soft_dof_vel_curriculum_degree: 2.5e-07
+      soft_dof_vel_curriculum_level_down_threshold: 40
+      soft_dof_vel_curriculum_level_up_threshold: 42
+      soft_torque_curriculum: false
+      soft_torque_initial_limit: 1.15
+      soft_torque_max_limit: 1.25
+      soft_torque_min_limit: 0.85
+      soft_torque_curriculum_degree: 2.5e-07
+      soft_torque_curriculum_level_down_threshold: 40
+      soft_torque_curriculum_level_up_threshold: 42
+  reward_penalty_curriculum: true
+  reward_initial_penalty_scale: 1.0
+  reward_min_penalty_scale: 0.2
+  reward_max_penalty_scale: 1.0
+  reward_penalty_level_down_ave_goal_reached_rate: 0.5
+  reward_penalty_level_up_ave_goal_reached_rate: 0.7
+  reward_penalty_degree: -0.0001
+  num_compute_average_epl: 10000
+  reward_penalty_reward_names:
+  - walk_to_bin
+  - stop_at_bin
+  - reach_finger_dof_pos_l1
+  - reach_left
+  - reach_right
+  - maintain_standoff
+  - palm_down_alignment
+  - palm_twist_alignment
+  - grasp_finger_dof_pos_l1
+  - grasp_target_distance
+  - push_bin_progress
+  - maintain_grasp_while_pushing
+obs:
+  obs_dict:
+    actor_obs:
+    - dof_pos
+    - relative_to_bin
+    - dof_vel
+    - actions
+    - projected_gravity
+    - bin_pose_progress
+    - base_lin_vel
+    - base_ang_vel
+    - hand_force
+    - stage
+    - privileged_bin_info
+    - delta_actions
+    - hand_bin_handle_transform
+    - unwarped_actions
+    - b_homie_commands
+    critic_obs:
+    - dof_pos
+    - relative_to_bin
+    - dof_vel
+    - actions
+    - projected_gravity
+    - bin_pose_progress
+    - base_lin_vel
+    - base_ang_vel
+    - hand_force
+    - stage
+    - privileged_bin_info
+    - delta_actions
+    - hand_bin_handle_transform
+    - unwarped_actions
+    - transition
+    - complete
+    - time_in_stage
+    - actual_time_in_stage
+    - total_time
+    - b_homie_commands
+    homie_obs:
+    - a_history_homie
+    - b_homie_commands
+    - c_homie_base_ang_vel
+    - d_homie_projected_gravity
+    - e_homie_dof_pos
+    - f_homie_dof_vel
+    - g_homie_body_actions
+  obs_auxiliary:
+    history_long:
+      dof_pos: 20
+      relative_to_bin: 20
+      dof_vel: 2
+      actions: 15
+      projected_gravity: 15
+      bin_pose_progress: 15
+      base_lin_vel: 15
+      base_ang_vel: 15
+      hand_force: 15
+      stage: 15
+      privileged_bin_info: 15
+      delta_actions: 15
+      hand_bin_handle_transform: 15
+      transition: 15
+      complete: 15
+      time_in_stage: 15
+      actual_time_in_stage: 15
+    a_history_homie:
+      b_homie_commands: 5
+      c_homie_base_ang_vel: 5
+      d_homie_projected_gravity: 5
+      e_homie_dof_pos: 5
+      f_homie_dof_vel: 5
+      g_homie_body_actions: 5
+    history_short:
+      dof_pos: 3
+      relative_to_bin: 3
+      dof_vel: 2
+      actions: 1
+      projected_gravity: 1
+      bin_pose_progress: 2
+      base_lin_vel: 2
+      base_ang_vel: 2
+      hand_force: 2
+      stage: 2
+      privileged_bin_info: 2
+      delta_actions: 2
+      hand_bin_handle_transform: 2
+      transition: 2
+      complete: 2
+      time_in_stage: 2
+      actual_time_in_stage: 2
+  homie_history_length: 5
+  obs_scales:
+    dof_pos: 1.0
+    relative_to_bin: 1.0
+    dof_vel: 0.05
+    history: 1.0
+    actions: 1.0
+    projected_gravity: 1.0
+    bin_pose_progress: 1.0
+    base_lin_vel: 1.0
+    base_ang_vel: 0.5
+    hand_force: 0.01
+    stage: 1.0
+    privileged_bin_info: 1.0
+    delta_actions: 1.0
+    hand_bin_handle_transform: 1.0
+    unwarped_actions: 1.0
+    transition: 1.0
+    complete: 1.0
+    time_in_stage: 1.0
+    actual_time_in_stage: 1.0
+    total_time: 1.0
+    b_homie_commands: 1.0
+    e_homie_dof_pos: 1.0
+    f_homie_dof_vel: 0.05
+    c_homie_base_ang_vel: 0.5
+    d_homie_projected_gravity: 1.0
+    g_homie_body_actions: 1.0
+    a_history_homie: 1.0
+  noise_scales:
+    dof_pos: 0.01
+    relative_to_bin: 0.0
+    dof_vel: 0.2
+    history: 0.0
+    actions: 0.0
+    projected_gravity: 0.0
+    bin_pose_progress: 0.0
+    base_lin_vel: 0.0
+    base_ang_vel: 0.0
+    hand_force: 0.0
+    stage: 0.0
+    privileged_bin_info: 0.0
+    delta_actions: 0.0
+    hand_bin_handle_transform: 0.0
+    unwarped_actions: 0.0
+    transition: 0.0
+    complete: 0.0
+    time_in_stage: 0.0
+    actual_time_in_stage: 0.0
+    total_time: 0.0
+    b_homie_commands: 0.0
+    e_homie_dof_pos: 0.01
+    f_homie_dof_vel: 0.2
+    c_homie_base_ang_vel: 0.0
+    d_homie_projected_gravity: 0.0
+    g_homie_body_actions: 0.0
+    a_history_homie: 0.0
+  add_noise_currculum: false
+  noise_initial_value: 0.05
+  noise_value_max: 1.0
+  noise_value_min: 1.0e-05
+  obs_dims:
+  - dof_pos: ${robot.dof_obs_size}
+  - hand_force: ${eval:'2 * 8 * 3'}
+  - relative_to_bin: 9
+  - dof_vel: ${robot.dof_obs_size}
+  - actions: ${robot.actions_dim}
+  - projected_gravity: 3
+  - bin_pose_progress: 1
+  - base_lin_vel: 3
+  - base_ang_vel: 3
+  - stage: ${eval:'len(${env.config.max_stage_time})'}
+  - privileged_bin_info: 6
+  - hand_bin_handle_transform: 18
+  - b_homie_commands: 7
+  - e_homie_dof_pos: ${robot.homie_dof_obs_size}
+  - f_homie_dof_vel: ${robot.homie_dof_obs_size}
+  - c_homie_base_ang_vel: 3
+  - d_homie_projected_gravity: 3
+  - g_homie_body_actions: ${robot.lower_body_actions_dim}
+  - transition: 1
+  - complete: 1
+  - time_in_stage: 1
+  - actual_time_in_stage: 1
+  - total_time: 1
+  - delta_actions: ${eval:'len(${env.config.delta_action_indices})'}
+  - unwarped_actions: ${eval:'len(${env.config.warped_action.indices})'}
+  homie_command_keys:
+    loco_vel: null
+    left_arm: null
+    right_arm: null
+    left_hand: null
+    right_hand: null
+  homie_command_default:
+    loco_vel:
+    - 0.0
+    - 0.0
+    - 0.0
+    height:
+    - 0.0
+    rpy:
+    - 0.0
+    - 0.0
+    - 0.0
+    left_arm:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    right_arm:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    left_hand:
+    - 0.0
+    right_hand:
+    - 0.0
+  homie_command_index:
+    loco_vel:
+    - 0
+    - 1
+    - 2
+    height:
+    - 3
+    rpy:
+    - 4
+    - 5
+    - 6
+    left_arm:
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    right_arm:
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    left_hand:
+    - 21
+    right_hand:
+    - 22
+  homie_default_height: 0.74
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: lstm

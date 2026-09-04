@@ -1,0 +1,60 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+logs/
+logs_eval/
+logs_rl/
+outputs/
+wandb/
+*.log
+*.mp4
+*.npz
+
+# pulled diagnostic-run (checkpoint, video) pairs -- derived artifacts, not
+# the curated baseline checkpoint
+/runs/
+
+# scratch iteration renders from show_pregrasp_cusp.py design-check sessions --
+# throwaway visual QA, not curated deliverables
+/move_garbage/scripts/pregrasp_cusp_renders/
+
+# local delta-tracking cache for status_table.sh -- machine-specific state,
+# not a deliverable (path resolves next to the script itself, in debug/)
+/move_garbage/scripts/debug/.status_table_cache.json
+
+# same class as pregrasp_cusp_renders above -- throwaway wrap-feasibility
+# sweep renders from sweep_wrap_orientation.py, not curated deliverables
+/move_garbage/scripts/wrap_feasibility_renders/
+
+# investigation/debugging scripts from the 2026-09-01/02 grasp-target
+# investigation -- kept locally for reference, intentionally not part of the
+# public repo (goal is to educate on the working project, not walk through
+# every debugging dead-end). See move_garbage/scripts/ for the curated,
+# README-documented tools.
+/move_garbage/scripts/debug/
+
+# tensorboard event dumps -- regenerable telemetry, not source
+/tb_logs/
+
+# redundant duplicate of the already-tracked move_garbage/checkpoints/
+# baseline checkpoint, pulled down during 2026-09-01 VM teardown -- not a
+# second thing to track
+/move_garbage/checkpoints_backup_20260901/
+
+# raw pip freeze snapshot from VM teardown -- a dump, not curated
+/vm_pip_freeze.txt
+
+# dated scratch investigation notes -- not curated documentation
+/VM_SETUP_NOTES.md
+/move_garbage/GRASP_FLOW_DEEP_REVIEW_2026-08-30.md
+/move_garbage/GRASP_FLOW_DEEP_REVIEW_CRITIQUE_2026-08-30.md
+/move_garbage/GRASP_FLOW_SUGGESTIONS_2026-08-30.md
+
+
+# macOS
+.DS_Store

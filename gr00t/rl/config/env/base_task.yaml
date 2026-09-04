@@ -1,0 +1,16 @@
+# @package _global_
+
+env:
+  _target_: gr00t.rl.envs.base_task.base_task.BaseTask
+  _recursive_: False
+  config:
+    experiment_name: ${experiment_name}
+    num_envs: ${num_envs}
+    headless: ${headless}
+    simulator: ${simulator}
+    save_rendering_dir: null
+    experiment_dir: null
+    ckpt_dir: null
+
+# Globally accessible parameters
+log_task_name: base_task

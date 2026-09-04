@@ -1,0 +1,178 @@
+# @package _global_
+
+# Hydra wiring for the bin-push teacher experiment. The local task config is
+# selected through the Hydra search path shown in README.md. Isaac Sim discovers
+# the bundled compatibility wrapper at
+# gr00t/rl/data/tasks/bin/scenario_cfg/isaacsim.py; no symlink or generated
+# setup is required.
+
+defaults:
+  - /algo: ppo
+  - /env: bin_push_homie
+  - /simulator: isaacsim
+  - /domain_rand: NO_domain_rand
+  - /rewards: wbmanip/reward_bin_push_homie
+  - /robot: g1/g1_43dof
+  - /terrain: terrain_locomotion_plane
+  - /obs: wbmanip/bin_push_homie
+  - /opt: wandb
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: lstm
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 4096
+project_name: g1_bin_push_homie
+
+algo:
+  config:
+    # 0.01 -> 0.003 (2026-08-06): entropy_coef pushes EVERY action-dim's std up
+    # every step (entropy of a Normal grows monotonically with std), competing
+    # against whatever policy-gradient pressure shrinks it. Checkpoint 6700 of
+    # bin_TWISTFIX_resume6k showed all 14 arm-joint + 2 finger dims pinned at
+    # the max_noise_std=0.8 ceiling for 6700+ iterations (only the 2 HOMIE
+    # locomotion dims had shrunk, to ~0.28) while palm twist error sat flat at
+    # 106-138deg despite a confirmed-nonzero reward gradient there (see
+    # palm_twist_std note below). A sub-agent investigation ruled out a
+    # reachability ceiling (fresh IK-only test converges to 17-51deg, well
+    # under the 60deg grasp_finger_close_max_twist_rad gate) and a
+    # position/twist trade-off (correlation negligible across a 128-env
+    # rollout) — leaving exploration noise never shrinking on the arm dims as
+    # the dominant explanation. Lowering entropy_coef reduces that constant
+    # upward pressure so the arm/wrist std can actually start shrinking.
+    entropy_coef: 0.003
+    use_new_actor_critic: True
+    num_steps_per_env: 64
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    use_padding_mask: False
+    ppo_shuffle_every_epoch: True
+    sync_advantage_normalization: True
+    actor_learning_rate: 1.0e-4
+    critic_learning_rate: 1.0e-4
+    homie_walk_model_path: ./models/model_walk.pt
+    homie_stand_model_path: ./models/model_stand.pt
+    homie_command_dim: 3  # vx, vy, yaw
+    non_homie_command_actions_dim: 16  # 14 upper body dofs + 2 finger primitives
+    opt_homie: False
+    desired_kl: 0.005
+
+    init_noise_std: 0.8
+    max_noise_std: 0.8
+    min_noise_std: 0.1
+    clamp_noise_std: True
+    save_interval: 50
+
+    gamma: 0.9975
+    lam: 0.985
+
+    init_at_random_ep_len: False
+
+    actor:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentActor
+      running_mean_std: True
+      rnn_type: "lstm"
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          input_dim: [actor_obs]
+          output_dim:
+            - ${eval:'${algo.config.homie_command_dim} + ${algo.config.non_homie_command_actions_dim}'}
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+    critic:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentCritic
+      running_mean_std: True
+      rnn_type: "lstm"
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          type: MLP
+          input_dim: [critic_obs]
+          output_dim: [1]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+
+simulator:
+  config:
+    scene:
+      replicate_physics: False
+      env_spacing: 20.0
+    sim:
+      physx:
+        num_position_iterations: 8
+        num_velocity_iterations: 4
+
+robot:
+  asset:
+    self_collisions: 0
+  finger_primitive:
+    # dof_names order (see gr00t/rl/config/robot/g1/g1_43dof.yaml's
+    # primitive_action_map): [index_0, middle_0, thumb_0, index_1, middle_1,
+    # thumb_1, thumb_2].
+    #
+    # 2026-08-29/30: pos_0 (the "open" primitive endpoint) changed from a
+    # relaxed-rest pose to 0.0 on every joint -- the hardware-grounded
+    # "straight" pose, confirmed via direct inspection of
+    # gr00t/rl/data/robots/g1/g1_43dof_s3.usda's PhysicsRevoluteJoint
+    # lowerLimit/upperLimit: index_0/middle_0 range [-90,0]deg,
+    # index_1/middle_1 range [~-100,0]deg, thumb_1 range [-41.5,60]deg,
+    # thumb_2 range [0,~100]deg -- EVERY joint's "open" extreme sits at
+    # exactly 0deg. The old pos_0 (-60deg on index_0/middle_0, -30deg on
+    # index_1/middle_1/thumb_1, 30deg on thumb_2) only used ~2/3 of the
+    # available opening range; found via show_pregrasp_cusp.py rendering a
+    # fraction=0.0 (pure old pos_0) hand and it still looking meaningfully
+    # curled, not flat/open, contrary to what "fully open" should look
+    # like. pos_1 (closed) is UNCHANGED -- already confirmed at genuine
+    # hardware limits (index_0/middle_0 = -90deg = the lowerLimit exactly).
+    #
+    # REAL BLAST RADIUS, not scoped to one reward: this is the actual
+    # policy ACTION SPACE endpoint (FingerPrimitiveBase linearly maps the
+    # policy's raw action through pos_0/pos_1 every step, all 4 stages),
+    # not just a reward-shaping reference. Also directly targeted by
+    # bin_push_homie.py's _reward_reach_finger_dof_pos_l1 (APPROACH+REACH),
+    # used as a MULTIPLICATIVE GATE on _reward_reach_left/right (via
+    # _one_hand_reach's finger_gate), and a HARD requirement in
+    # _reach_transition_ready_mask (fingers within ~10deg of pos_0 to
+    # advance REACH->GRASP) -- REACH-stage behavior converged under the OLD
+    # pos_0 across this project's history will need to re-adapt to the new
+    # value. Needs real training validation, not just the visual check this
+    # was designed from.
+    primitive_action_map:
+      left:
+        pos_0: [
+          0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0,
+          0.0
+        ]
+        pos_1: [
+          -1.5708, -1.5708, 0.0,
+          -1.5708, -1.5708, 0.785398,
+          1.5708
+        ]
+      right:
+        pos_0: [
+          0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0,
+          0.0
+        ]
+        pos_1: [
+          1.5708, 1.5708, 0.0,
+          1.5708, 1.5708, -0.785398,
+          -1.5708
+        ]
+  use_primitive: True
+  actions_dim: 31
+  check_action_dim: False
+  terminate_after_contacts_on: ["head", "knee", "wrist"]

@@ -1,0 +1,66 @@
+# @package _global_
+
+# Env structure
+simulator:
+  _target_: gr00t.rl.simulator.isaacsim.isaacsim.IsaacSim
+  _recursive_: False
+  config:
+    name: "isaacsim"
+    render_results: false
+    terrain: ${terrain}
+    plane:
+        static_friction: 1.0
+        dynamic_friction: 1.0
+        restitution: 0.0
+    sim:
+      fps: 200
+      control_decimation: 4
+      substeps: 1
+      physx:
+        num_threads: 10
+        solver_type: 1 # 0: pgs, 1: tgs
+        num_position_iterations: 4
+        num_velocity_iterations: 0
+        contact_offset: 0.01
+        rest_offset: 0.0
+        bounce_threshold_velocity: 0.5
+        max_depenetration_velocity: 1.0
+        default_buffer_size_multiplier: 5
+        contact_collection: 2
+      render_mode: "human" # [None, "human", "rgb_array"]
+      render_interval: 1
+    
+    cameras:
+      enable_cameras: false
+      camera_attached_link: "d435_link"
+      camera_pos_offset: [0.0, 0.035, 0.0]
+      camera_rot_offset: [0.99955, 0.0, 0.0299955, 0.0] # match the realsense 435 by real2sim alignment
+      camera_yaw_only: true
+      camera_focal_length: 1.88
+      camera_focus_distance: 0.5
+      camera_horizontal_aperture: 2.6035
+      camera_vertical_aperture: 1.4621
+      camera_clipping_range: (0.1, 20.0)
+      camera_types:
+        - rgb: true
+        - depth: false
+      camera_resolutions: [240, 426]  # [height, width]
+      image_mean: [0.485, 0.456, 0.406]
+      image_std: [0.229, 0.224, 0.225]
+      
+    heightmap:
+      enable_heightmap: false
+      resolution: 9
+      grid_size: 1.6
+    
+    scene:
+      num_envs: ${num_envs}
+      env_spacing: ${env.config.env_spacing}
+      replicate_physics: True
+    
+    actuators:
+      actuation_mode: "idealpd" # ["idealpd", "implicit"]
+
+
+     
+# camera_resolutions: [64, 64]

@@ -1,0 +1,10 @@
+eval_interval: 0  # 0 means eval is turned off; how many training `batch_idx` between evaluations
+num_eval_episodes: 200  # number of episodes to evaluate per device; may be overridden by num_save_episodes
+save_videos: false  # whether to save videos
+video_save_prob: 0.05  # the probability of saving videos, i.e., num_eval_episodes * video_save_prob is expected to be saved
+
+save_goal_reached_only: false  # whether to only save successful trajectories
+
+# The following two parameters are about saving trajectories
+save_trajectories: false
+num_save_episodes: 200  # number of episodes to save per device; will override num_eval_episodes

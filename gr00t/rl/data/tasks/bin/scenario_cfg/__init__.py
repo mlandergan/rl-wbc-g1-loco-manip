@@ -1,0 +1,2 @@
+"""Bin task scenario configuration."""
+

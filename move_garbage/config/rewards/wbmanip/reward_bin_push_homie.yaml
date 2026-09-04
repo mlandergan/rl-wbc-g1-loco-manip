@@ -1,0 +1,308 @@
+# @package _global_
+
+rewards:
+  set_reward: BinPush
+  set_reward_date: 20260710
+  only_positive_rewards: False
+  reward_scales:
+    penalty_dof_acc: -1.0e-5
+    penalty_dof_vel: -1.0e-3
+    penalty_delta_action_rate: -0.01
+
+    termination: -1000.0
+    limits_dof_pos: -5.0
+    limits_primitive_action: -1.0
+
+    # APPROACH (stage 0)
+    walk_to_bin: 5.0
+    # stop_at_bin bumped 3.0 -> 8.0 (Run 5): walk_to_bin keeps paying velocity
+    # reward at close range, so braking must out-weigh coasting locally. Bigger
+    # scale lets stop_at_bin win at the stop pose without a walk taper (the taper
+    # approach in Run 4 damped approach learning — reverted).
+    stop_at_bin: 8.0
+    penalty_upper_body_non_finger_deviation_l1: -1.0
+
+    # REACH (stage 1)
+    # Run 15: split the single bimanual reach reward into INDEPENDENT left/right
+    # terms (3.0 each = old 6.0 total). 0.5*(L+R) farmed the easy hand; min(L,R)
+    # gave the better hand zero gradient (left stuck 0.25m while right at 0.10m).
+    # Separate terms give each hand its own dense gradient + are self-diagnosing.
+    reach_left: 3.0
+    reach_right: 3.0
+    reach_finger_dof_pos_l1: 1.5
+    # 3.0 -> 6.0 (2026-08-30): active REACH+GRASP, holds the pelvis at the
+    # grasp-relative stance -- the direct competitor to grasp_bar_distance's
+    # pull toward the (closer) raw bar. A 300-iteration trend after the
+    # grasp_bar_valid_dist retune (0.03->0.08) showed reach_standoff_s1/
+    # grasp_standoff_s2 drifting from ~0.50/0.45m (right after the original
+    # resume) down to ~0.44/0.41m -- not violating the hard too-close floor
+    # (approach_min_standoff 0.40 / min_grasp_standoff 0.34, too_close_frac
+    # stayed <1% throughout, confirmed penalty_too_close_to_bin isn't even
+    # engaged at these distances), so the barrier penalty was never the
+    # right lever -- this dense Gaussian losing ground to grasp_bar_distance
+    # (6.0) is. Doubled to match that weight directly rather than guessing a
+    # new number. NOT yet empirically validated at 6.0 -- watch reach/grasp_
+    # standoff specifically once retested.
+    maintain_standoff: 6.0
+    # Run 19 (2026-08-01): dense twist-about-palm-down-axis shaping, active
+    # REACH/GRASP/PUSH alongside palm_down_alignment (which only covers the
+    # face-normal, not twist). See _reward_palm_twist_alignment.
+    # Run 22 (2026-08-08): 3100 iters post entropy_coef fix (0.01->0.003, see
+    # exp yaml) showed exploration noise DID shrink on arm dims, but twist
+    # error converged to the SAME wrong value (~139deg/109deg) instead of
+    # improving — the policy found a stable optimum that isn't the correct
+    # twist. Root cause: _reward_grasp_contact (scale 5.0, the LARGEST
+    # GRASP-stage term) gates only on face-normal alignment (already ~0.97,
+    # maxed) and NOT on twist, so the robot collects near-full contact reward
+    # regardless of twist — outcompeting this term for the arm-joint gradient.
+    # Raised 3.0->7.0 so twist competes on stronger footing against
+    # grasp_contact instead of losing to it.
+    palm_twist_alignment: 7.0
+    # Run 24 (2026-08-11): 650 iters post contact-fix restart (ckpt 6650) shows
+    # real but slow twist improvement (right hand ~140->70-80deg, left hand
+    # ~122->~106deg) - the Gaussian above has already been widened (std
+    # 0.6->1.2) but still has weak gradient way out at these error magnitudes.
+    # Literature (dexterous pre-grasp manipulation reward shaping,
+    # arXiv:2307.16752 eq 10/16) uses a potential/progress term instead:
+    # reward = (prev_error - cur_error), constant gradient at ANY error
+    # magnitude. Added as an independent term (see
+    # _reward_palm_twist_progress) rather than folded into palm_twist_alignment
+    # so each can be tuned separately. Starting scale is a guess - watch
+    # measure_standoff.py trend and retune.
+    palm_twist_progress: 5.0
+    penalty_too_close_to_bin: -5.0
+    # -15.0 -> -6.0 (Run 8): this was the LARGEST effective penalty (~-1.53) and is
+    # active in REACH/GRASP. It penalizes any nonzero HOMIE locomotion command, which
+    # fights the small stance shift the robot needs to lift its hands up-and-over the
+    # rim. Reduced so reaching for the handles isn't over-penalized.
+    penalty_not_standing_still: -6.0
+
+    # GRASP (stage 2)
+    # 3.0 -> 6.0 (2026-08-30): tracks the distance-graded curl target from
+    # _pregrasp_curl_fraction (see that method's docstring) -- its own raw
+    # reward was climbing fine post-retune (0->0.26 over 25 iters) but the
+    # TARGET itself is capped near fraction~=0.33-0.4 because bar_dist
+    # plateaued ~0.10-0.11m (fraction = (0.15-bar_dist)/0.15, only reaches 1
+    # as bar_dist->0). Doubling this so tracking whatever target IS live
+    # competes harder for gradient against the other GRASP terms, paired
+    # with the grasp_bar_distance bump below so the target itself keeps
+    # climbing too -- two levers addressing the same plateau from both
+    # ends (chase the target harder + make the target ask for more).
+    # NOT yet empirically validated -- watch rew_grasp_finger_dof_pos_l1 and
+    # bar_dist together once retested.
+    grasp_finger_dof_pos_l1: 6.0
+    grasp_target_distance: 3.0
+    # Axis-aware companion using 8 cm horizontal and 6 cm vertical widths.
+    # The original isotropic reward remains active as a broad radial pull.
+    grasp_target_anisotropic: 6.0
+    # 2026-08-29: NEW pair. grasp_target_distance/anisotropic above both
+    # target the offset HOVER point (_left/right_handle_target), not the
+    # true bar -- so once the bar-distance validity gate (grasp_bar_valid_
+    # dist) became distance-based instead of contact-based, the policy had
+    # NO continuous gradient pulling it past its hover-target equilibrium
+    # (~0.10-0.11m) toward the gate's 0.03m threshold. Confirmed via a real
+    # 150-iteration trend: fast initial adaptation, then a flat 40+
+    # iteration plateau well short of threshold. Same fix shape as
+    # grasp_vert_progress below (dense Gaussian + potential-based progress
+    # term together, mirroring that Run 25/26 history) -- started at the
+    # SAME scales as their direct analogs (grasp_target_distance=3.0,
+    # grasp_vert_progress=12.0) since both are structurally identical
+    # (same std/max_step_error defaults), not yet independently retuned.
+    #
+    # 2026-08-29 (same day, follow-up): 3.0 -> 6.0. A 67-iteration trend
+    # showed bar distance decelerating, plateau-ish around 0.10-0.11m.
+    # Root cause: grasp_target_distance (3.0) + grasp_target_anisotropic
+    # (6.0) = 9.0 combined pulling toward the OFFSET hover target, active
+    # in the SAME stages (GRASP+PUSH) as this term's pull toward the RAW
+    # bar (was only 3.0) -- a real 3:1 imbalance toward the wrong point,
+    # not just "needs more time." Not raised all the way to 9.0 (full
+    # magnitude match) -- 6.0 as a moderate first correction, watch the
+    # trend before going further.
+    #
+    # 2026-08-30: 6.0 -> 9.0, the full magnitude match flagged above as the
+    # next step if 6.0 wasn't enough. It wasn't: after the grasp_bar_valid_
+    # dist retune (0.03->0.08, which made bar_dist~0.08-0.10m achievable for
+    # success), bar_dist plateaued flat at ~0.107-0.117m for 30 iterations
+    # straight with no further improvement -- the retune removed the urgency
+    # to close the gap further since ~0.10m already clears the gate most of
+    # the time. This term's own Gaussian (std=0.1) doesn't mathematically
+    # flatten near this distance, so the plateau reads as a competing-
+    # pressure equilibrium (vs. grasp_target_distance+anisotropic's 9.0
+    # toward the offset hover point, plus the standoff terms) rather than a
+    # vanishing-gradient problem -- raising to the already-planned 9.0 for
+    # direct parity against that combined pull. NOT yet empirically
+    # validated -- watch bar_dist specifically, and whether it keeps
+    # declining past ~0.10m this time, once retested.
+    grasp_bar_distance: 9.0
+    grasp_bar_progress: 12.0
+    # 2026-08-29: PREPARED, NOT YET DEPLOYED to the live run -- written per
+    # user request after direct video review showed both hands landing with
+    # fingers nearly flat, pressed on top of the bin's flat lid-lip surface
+    # instead of curled under/around it (the lid physically blocks further
+    # curl once fingers are already flat against it). Neither
+    # grasp_finger_dof_pos_l1 (DOF-angle target only) nor grasp_bar_distance
+    # (palm position only, see _reward_grasp_bar_distance docstring) can
+    # detect this specific failure mode. New term: fingertip-specific
+    # contact force (index_1/middle_1/thumb_2 links only, not all 8
+    # candidates), smoothly gated by proximity to the true bar. See
+    # _reward_grasp_fingertip_curl docstring for full design rationale.
+    # 4.0 is a reasoned starting point (roughly half of grasp_contact's 5.0,
+    # since this is a narrower/more specific signal on top of that broader
+    # one, not a replacement for it) -- NOT empirically validated. This
+    # entry only takes effect on the NEXT resume of this yaml; the
+    # currently-running training process already loaded its config and is
+    # unaffected until intentionally restarted.
+    grasp_fingertip_curl: 4.0
+    # 2026-08-29: companion penalty, logical complement of
+    # grasp_fingertip_curl above (same proximity gate + tensor, complement
+    # link set -- see _reward_penalty_grasp_flat_press docstring). Modest
+    # negative scale (half of grasp_fingertip_curl's magnitude) so it's a
+    # real but not dominant discouragement -- not empirically validated.
+    penalty_grasp_flat_press: -2.0
+    grasp_contact: 5.0
+    # Run 25 (2026-08-13): companion to grasp_contact's new decomposed
+    # horiz/vert fine gate (see _reward_grasp_contact docstring) — zeroing
+    # that reward for a hovering-above hand removed ~0.65/step of GRASP
+    # reward at a stroke, and the only remaining dense pull toward the fine
+    # target (grasp_target_distance, isotropic std=0.1) wasn't enough on its
+    # own: horiz_ok regressed 40%->16% (left) and 15%->9% (right) within 350
+    # iterations while vert_ok stayed pinned near 0%. Same progress-reward
+    # pattern as palm_twist_progress, applied to vertical error specifically
+    # since that's the diagnosed, non-moving axis.
+    # Run 26 (2026-08-14): 750+ iterations in, this term's own raw mean was
+    # DECLINING (0.0012->0.0005), the opposite of how palm_twist_progress
+    # behaved during its actual convergence (grew 0.0004->0.0014) - net
+    # vertical progress was shrinking, not accelerating, while
+    # grasp_target_distance and both_close_frac fell in step (81%->9%) as
+    # palm_down_alignment climbed (0.59->0.67). Raised 5.0->12.0 (~2.4x,
+    # matching the relative bump that worked for palm_twist_alignment
+    # 3.0->7.0 in Run 22) to give it more say without the ~300x a raw
+    # magnitude-match against alignment's saturated Gaussian would require
+    # (which would make this volatile - progress terms swing negative too).
+    grasp_vert_progress: 12.0
+    # Run 26 (2026-08-14): lowered 3.0->2.0 alongside the grasp_vert_progress
+    # bump above. Alignment's own convergence is real and hard-won (0.59->
+    # 0.67) - not zeroing it, since that risks re-triggering the original
+    # bad-twist wedge it was added to prevent - but at scale 3.0 its
+    # saturated ~0.5-0.6 mean was contributing ~1.5-1.9 to the total reward,
+    # 3-4x grasp_target_distance's ~0.45-0.6, while position/vert_progress
+    # were actively regressing in the same window. Dialed back to give
+    # position more room to compete.
+    palm_down_alignment: 2.0
+    # Run 23 (2026-08-11): companion to grasp_contact's new twist gate (see
+    # _reward_penalty_wrong_twist_contact docstring) — a live rollout showed
+    # the palm wedged against the rim with twist 100-140deg off target for
+    # 200+ consecutive frames, collecting ~full grasp_contact reward the
+    # whole time (measure_standoff.py: 96% "close & aligned" while
+    # grasp_valid_frac stayed 0%). This directly penalizes touching the bin
+    # while twist exceeds the hard grasp gate, so backing off to reorient
+    # isn't purely a reward loss.
+    penalty_wrong_twist_contact: -2.0
+
+    # PUSH (stage 3)
+    push_bin_progress: 16.0
+    maintain_grasp_while_pushing: 2.0
+    step_forward_while_pushing: 4.0
+    # 2026-08-29: NEW. DoorMan's analogous push_door_force uses scale 0.3
+    # against a [0,20]-clamped raw-force term -- same clamp range here, same
+    # scale, no local justification yet to deviate. See
+    # _reward_push_bin_force docstring for why this term exists (fills a
+    # missing-gradient gap: push_bin_progress alone doesn't pay anything
+    # until the bin already moves, which real static friction on a ~15kg
+    # bin makes a real chicken-and-egg problem for pure exploration to
+    # solve). Watch its mean once tested -- retune if it saturates the clamp
+    # immediately or stays near zero.
+    push_bin_force: 0.3
+
+    # Bin-specific penalties (new relative to drawer)
+    penalty_bin_wheel_kick: -0.1
+    penalty_bin_tilt: -1.0
+    penalty_asymmetric_grasp: -0.5
+
+    # Always-on
+    stage: 1.0
+    complete: 4.0
+    penalty_humanly_dof_limit: -1.0
+    penalty_undesired_contact: -0.2
+    penalty_dof_overspeed: -0.1
+    penalty_upright: -1.0
+    penalty_homie_action_limit: -1.0
+    penalty_face_bin: -3.0
+
+  reward_limit:
+    soft_dof_pos_limit: 0.95
+    soft_dof_vel_limit: 0.95
+    soft_torque_limit: 0.9
+
+    reward_limits_curriculum:
+      soft_dof_pos_curriculum: False
+      soft_dof_pos_initial_limit: 1.15
+      soft_dof_pos_max_limit: 1.15
+      soft_dof_pos_min_limit: 0.95
+      soft_dof_pos_curriculum_degree: 0.00000025
+      soft_dof_pos_curriculum_level_down_threshold: 40
+      soft_dof_pos_curriculum_level_up_threshold: 42
+
+      soft_dof_vel_curriculum: False
+      soft_dof_vel_initial_limit: 1.15
+      soft_dof_vel_max_limit: 1.25
+      soft_dof_vel_min_limit: 0.95
+      soft_dof_vel_curriculum_degree: 0.00000025
+      soft_dof_vel_curriculum_level_down_threshold: 40
+      soft_dof_vel_curriculum_level_up_threshold: 42
+
+      soft_torque_curriculum: False
+      soft_torque_initial_limit: 1.15
+      soft_torque_max_limit: 1.25
+      soft_torque_min_limit: 0.85
+      soft_torque_curriculum_degree: 0.00000025
+      soft_torque_curriculum_level_down_threshold: 40
+      soft_torque_curriculum_level_up_threshold: 42
+
+  reward_penalty_curriculum: True
+  reward_initial_penalty_scale: 1.0
+  reward_min_penalty_scale: 0.2
+  reward_max_penalty_scale: 1.0
+  reward_penalty_level_down_ave_goal_reached_rate: 0.5
+  reward_penalty_level_up_ave_goal_reached_rate: 0.7
+  # -0.0001 -> +0.0001 (2026-08-30): same sign-inversion fix as env.config.
+  # termination_curriculum.degree (see that key's comment for the full
+  # analysis) -- this one scales the 13 reward_penalty_reward_names terms
+  # below (walk_to_bin, stop_at_bin, reach_left/right,
+  # reach_finger_dof_pos_l1, maintain_standoff, palm_down_alignment,
+  # palm_twist_alignment, grasp_finger_dof_pos_l1, grasp_target_distance,
+  # grasp_target_anisotropic, push_bin_progress, maintain_grasp_while_
+  # pushing). Confirmed mathematically inert so far (reward_initial_penalty_
+  # scale==reward_max_penalty_scale==1.0, so under the OLD negative sign the
+  # only reachable state was "pinned at 1.0" the entire time -- full task
+  # completion, which gates the decay branch at >0.7, has never happened).
+  # Free fix now while behaviorally invisible; would have silently decayed
+  # these 13 mostly-positive shaping terms toward the 0.2 floor the moment
+  # completion rate actually started climbing, backwards from the apparent
+  # "help early, taper once reliable" intent implied by the level_down/
+  # level_up naming.
+  reward_penalty_degree: 0.0001
+  num_compute_average_epl: 10000
+
+  reward_penalty_reward_names: [
+    # APPROACH
+    "walk_to_bin",
+    "stop_at_bin",
+
+    # REACH
+    "reach_finger_dof_pos_l1",
+    "reach_left",
+    "reach_right",
+    "maintain_standoff",
+    "palm_down_alignment",
+    "palm_twist_alignment",
+
+    # GRASP
+    "grasp_finger_dof_pos_l1",
+    "grasp_target_distance",
+    "grasp_target_anisotropic",
+
+    # PUSH
+    "push_bin_progress",
+    "maintain_grasp_while_pushing",
+  ]

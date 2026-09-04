@@ -1,0 +1,539 @@
+# @package _global_
+
+defaults:
+  - legged_base
+
+env:
+  _target_: move_garbage.envs.bin_push_homie.BinPushHomie
+  config:
+    max_episode_length_s: 20
+
+    normalization:
+      clip_actions: 100.0
+      clip_observations: 100.0
+
+    termination:
+      terminate_when_close_to_dof_pos_limit: False
+      terminate_when_close_to_dof_vel_limit: False
+      terminate_when_close_to_torque_limit: False
+      terminate_by_contact: False
+      terminate_by_gravity: False
+      terminate_by_low_height: True
+    termination_scales:
+      termination_close_to_dof_pos_limit: 0.98
+      termination_close_to_dof_vel_limit: 0.98
+      termination_close_to_torque_limit: 0.98
+      termination_gravity_x: 0.5
+      termination_gravity_y: 0.5
+      termination_min_base_height: 0.5
+      termination_contact_force: 10.0
+
+    noise_to_initial_level: 0
+    init_noise_scale:
+      dof_pos: 0.1
+      dof_vel: 0.15
+      root_pos: 0.05
+      root_rot: 10
+      root_vel: 0.01
+      root_ang_vel: 0.01
+
+    task:
+      type: "manipulation"
+      name: "bin"
+      objects: ["bin"]
+      target_obj: "bin"
+      thershold: 0.05
+      target_obj_contact_sensor: False
+      # Simulator (isaacsim.py:865) uses this to build the object_to_hand
+      # contact sensor's prim_path. Our bin USD's rigid body is at `.../bin/body`,
+      # not `.../bin` (top is a bare Xform holding ArticulationRootAPI).
+      #
+      # 2026-08-27: briefly noted here that grasp validity no longer reads
+      # this sensor at all, in favor of a dedicated bar-scoped ContactSensor
+      # pair. REVERTED 2026-08-29 -- that approach (new collision geometry on
+      # grasp_target_left/right + two new ContactSensors) reliably hung
+      # simulation_app.close() at training shutdown. Grasp validity is now
+      # bar-DISTANCE-based instead (grasp_bar_valid_dist, below;
+      # bin_push_homie.py's _hand_bar_distances), not contact-force-based at
+      # all -- this key is back to being read only for its original purpose
+      # (object_to_hand_contact_forces, still used by _reward_grasp_contact
+      # for grip-direction shaping, and the object-to-hand frame transformer
+      # / bin-vs-table contact sensor in isaacsim.py).
+      target_obj_contact_sub_prim_path: "body"
+      target_obj_transform_sub_prim_path: "grasp_target_left"
+      # Bimanual — need both hands' contact links registered as filters on
+      # object_to_hand_contact_sensor. See simulator.isaacsim.py:838.
+      which_hand: "any_hand"
+
+    ref_height: 0.75
+
+    # Push task parameters (bin-specific).
+    target_bin_push_distance: 1.0
+    push_axis_world: [1.0, 0.0, 0.0]
+    target_root_vel: 0.3
+    # penalty_bin_tilt (PUSH stage only) rewards the natural 2-wheel push posture:
+    # bin tilted BACK toward the robot by this angle (handles come down ~10-15cm),
+    # not bolt-upright. Human-like weight distribution on the wheels.
+    bin_tilt_target_deg: 15.0
+
+    # Grasp-relative stop pose (see _stop_target_xy / _reward_stop_at_bin).
+    # stop_target = handle_mid + stop_standoff * face_normal. Replaces the old
+    # 0.9m bin-centered stop circle so "stopped" implies "positioned to grasp".
+    # stop_standoff 0.40 -> 0.48 (Run 8): the robot settled ~0.22m from the handle
+    # midpoint (closer than the 0.40 target) and couldn't raise its arms up-and-over
+    # the rim — palms stalled ~11cm below the 0.858m handles. Backing the stop pose
+    # out gives clearance to lift the arms to rim height.
+    # stop_standoff 0.48 -> 0.42 (Run 11): robot reliably reaches ~0.6m and its arm
+    # (now at correct height) can't cover the gap to handles from 0.48m out. Pull the
+    # target in so there's less distance for the arm to close.
+    # stop_standoff 0.36 -> 0.46 (2026-07-30, video review of step_003190): rollout
+    # video showed the robot standing too close to the bin, right arm winding up
+    # into a twisted pose instead of reaching cleanly. Moving the stop pose further
+    # back to give the arms more room, then training longer to let it settle in.
+    stop_standoff: 0.46    # m back from handle midpoint along grasp-face normal
+    # Preserve arm clearance after APPROACH. The previous circular 1.5*pos_std
+    # transition admitted poses ~15 cm inside this target, then stopped rewarding
+    # the exact stance once REACH began.
+    stop_transition_along_tolerance: 0.08
+    stop_transition_lateral_tolerance: 0.12
+    stage_advance_require_resting_arms: True
+    stage_advance_arm_tolerance: 0.3
+    maintain_standoff_std: 0.08
+    maintain_standoff_lateral_std: 0.12
+    # APPROACH braking barrier: start pushing back after a 4 cm overshoot, kept
+    # below the new 0.46m stop_standoff so the barrier doesn't fight the target.
+    approach_min_standoff: 0.40
+    approach_too_close_penalty_margin: 0.08
+    min_grasp_standoff: 0.34
+    too_close_penalty_margin: 0.10
+    # Coarse+fine horizontal tracking: the coarse term supplies gradient from the
+    # arms-down reset pose, while the fine term preserves precision near the rim.
+    reach_pos_std: 0.25
+    reach_pos_fine_std: 0.08
+    reach_pos_fine_weight: 0.35
+    reach_pos_std_vert: 0.20
+    # Run 19 (2026-08-01, video review of step_006300): vertical never got the
+    # coarse+fine split horizontal already has (Run 12/17). A palm floating
+    # +7cm above the true handle scored ~94% of vertical reward under the old
+    # single std=0.20 Gaussian, so there was no gradient to finish the descent
+    # even after the pregrasp arc's own target had already collapsed to ~0 at
+    # that horizontal distance. Mirrors reach_pos_fine_std/weight.
+    reach_pos_fine_std_vert: 0.04
+    reach_pos_fine_weight_vert: 0.5
+    # Position must dominate. The old (position + velocity).clamp(max=1) could
+    # saturate from velocity alone while a palm remained far from its handle.
+    reach_velocity_weight: 0.15
+    # Keep some arm-position gradient while randomized fingers learn to open.
+    reach_finger_gate_floor: 0.25
+    # A wrong-facing palm must not collect distance reward. The separate signed
+    # alignment reward supplies the rotation signal until the palm turns.
+    reach_orientation_gate_floor: 0.0
+    # Run 18: horizontal-vs-vertical weight in the reach pos reward. Equal 0.5/0.5
+    # let the policy farm the easy vertical axis (park at right height, vert_reward
+    # ~0.87) while stuck 0.31m short horizontally (horiz_reward ~0.05) — ~half the
+    # reach reward for never extending. 0.8 makes horizontal extension the only way
+    # to score meaningfully (parking-at-height caps at ~0.17).
+    reach_horiz_weight: 0.8
+    # Top-down pre-grasp (Run 16): raise the reach target this far above the handle
+    # while horizontally far, blend down to the handle within pregrasp_blend_dist.
+    # Forces the palm up-and-over then down onto the rim instead of coming from
+    # below and hitting the bottom rail.
+    # Run 17: lowered + widened so the target is STABLE in the palm's operating
+    # zone (was jittering +12cm at horiz>0.15, causing swipe-through, never settled).
+    # Run 20 (2026-08-01): Run 16/17's "arc" was actually a one-way monotonic
+    # collapse (elevated while far, descends as horiz shrinks) — it never asked
+    # the palm to swing UP, so a flat/from-below approach satisfied it just as
+    # well as a real over-the-top swoop. Replaced with a true triangular HUMP:
+    # pregrasp_height renamed pregrasp_arc_height (now the PEAK height above the
+    # rim, reached mid-approach), plus pregrasp_arc_peak_frac to place that peak.
+    # See _one_hand_reach for the exact shape.
+    pregrasp_arc_height: 0.10     # m above handle at the peak of the hump
+    pregrasp_arc_peak_frac: 0.75  # fraction of pregrasp_blend_dist where the hump peaks
+    pregrasp_blend_dist: 0.30    # m horizontal: target = true handle height at/beyond
+                                 # this AND at horiz=0; hump in between
+    # Sustained-reach bonus: reward HOLDING both palms near the handles over
+    # consecutive steps, so a swipe-through earns less than settle-and-hold.
+    reach_hold_dist: 0.15        # m: both palms within this counts as "holding"
+    reach_hold_full_steps: 15    # steps held to reach full hold bonus
+
+    # 2026-08-27: 1 -> 3 (bumped from an initial 2 once we confirmed each
+    # hand has 8 candidate contact links -- palm_link + 7 finger links across
+    # index/middle/thumb's 2-3 joints each -- so 2 was still a low bar,
+    # satisfiable by palm+one-knuckle with the fingers barely involved).
+    # Original comment below described 1 as sufficient
+    # because proximity/finger-closure gated advancement too -- but as of the
+    # DoorMan-style redesign (see bin_push_homie.py's _grasp_pose_valid_mask
+    # docstring), the success gate is contact-count ONLY now, no proximity or
+    # closure check backstopping it. push_valid_grasp_frac_s3 hit 98.8% but
+    # user's video review found no genuinely wrapped-around grasps -- the
+    # per-hand contact-count data (grasp_left/right_contacts_s2) sat right
+    # around ~1.0 the whole 4h run, consistent with single light-touch contact
+    # satisfying this gate rather than a real multi-point wrap. Also the
+    # likely root cause of rew_push_bin_progress plateauing near zero / rew_
+    # complete staying at exactly 0 the entire run -- a one-point touch can't
+    # transmit real force. Requiring 2 links is a real strengthening while
+    # still far simpler than the pre-redesign multi-condition geometric gate.
+    # A single stable link contact is the normal signal from each G1 hand on the
+    # narrow rim. Proximity and finger closure prevent incidental-contact advances.
+    #
+    # 2026-08-27: raising the count alone couldn't fully fix this -- the
+    # underlying sensor (target_obj_contact_sub_prim_path="body" below) reads
+    # contact against the ENTIRE bin body, so a flat palm pressed anywhere on
+    # the lid can rack up 3+ "contact links" just as easily as fingers
+    # actually wrapped around the bar. Root-caused via the runtime probe
+    # (contact position relative to the handle target, requested by user):
+    # confirmed contact points were landing on the broad lid surface, not the
+    # bar. Tried fixing with a small collision sphere directly on the USD
+    # asset at grasp_target_left/right + two dedicated ContactSensors --
+    # REVERTED 2026-08-29, that approach reliably hung simulation_app.close()
+    # at training shutdown (see bin_push_homie.py's _hand_bar_distances
+    # docstring for the full incident history).
+    #
+    # OBSOLETE as of 2026-08-29 -- no longer read anywhere in the live code
+    # path (was only ever read via grasp_contact_links_required, all of
+    # whose call sites now use grasp_bar_valid_dist below instead). Left
+    # defined, not deleted, per project convention. Grasp validity is
+    # DISTANCE-based now, not contact-force-based at all -- pure kinematic
+    # palm-to-bar-target distance, zero new USD geometry, zero new sensors,
+    # zero shutdown-hang risk.
+    grasp_contact_links_required: 3
+    # 2026-08-29: palm-to-bar distance threshold (meters) for grasp validity
+    # (_hand_bar_distances / _grasp_pose_valid_mask and every other former
+    # grasp_contact_links_required consumer). Measured against the RAW bar
+    # position now (_left/right_bar_raw_pos, a dedicated no-offset
+    # FrameTransformer -- see scene_creation_callback), NOT the REACH-stage
+    # hover target (_left/right_handle_target, offset ~4.12cm from the bar
+    # by grasp_target_standoff+height_offset) this was originally measured
+    # against. DoorMan's own grasp gate is contact-force-based, which only
+    # fires at near-zero physical separation -- so "close to the true bar"
+    # is the correct kinematic analog, not "close to a 4cm-offset hover
+    # point." 0.03 (3cm) was the original reasoned-but-unvalidated starting
+    # point (roughly the earlier bar-collision-sphere radius of 2.5cm plus a
+    # little slack for the virtual grasp point's own calibration
+    # uncertainty, palm_grasp_point_offset) -- NEVER crossed once across the
+    # entire bin_push_finger_fix run (300 iters) or the follow-up
+    # measure_bar_dist.py sweep on its final checkpoint (256 envs x 300
+    # steps, 37254 GRASP-stage samples): the both-hands-binding distance's
+    # absolute minimum ever observed was 0.0628m, roughly 2x looser than the
+    # 0.03 gate. 2026-08-30: retuned to 0.08 using that sweep's actual
+    # distribution, not a guess -- at 0.08m, 63.2% of envs reach it at least
+    # once (39.3% of all GRASP-stage step samples), vs. 0% at 0.03-0.06m and
+    # only 17.8%/2.2% at 0.07m. 0.10m was already ~96-99% (too loose, would
+    # trivialize the gate). Watch push_valid_grasp_frac_s3 plus a real video
+    # review once tested, same as every other threshold in this file.
+    # Tighter than grasp_transition_dist (10cm, below) on purpose, since
+    # that one gates an earlier, looser stage-advance readiness check
+    # against the OFFSET hover target, not final grasp validity against the
+    # raw bar.
+    grasp_bar_valid_dist: 0.08
+    grasp_transition_dist: 0.10
+    grasp_finger_closed_threshold: 0.174533
+    # Anatomical palm-side directions, matching the side the fingers curl toward.
+    # The older +Y/-Y convention reproduced a dorsal/back-of-hand pose.
+    left_palm_contact_axis: [0.0, -1.0, 0.0]
+    right_palm_contact_axis: [0.0, 1.0, 0.0]
+    # Direction from the palm-link origin INTO the finger-closing cavity (used
+    # only by _palm_grasp_points, NOT the face-normal check above). 2026-08-01
+    # fix: this used to reuse left/right_palm_contact_axis (local Y, the face
+    # normal), which sent the virtual grasp point past the thumb instead of
+    # into the palm center — measured actual simulated finger-link transforms
+    # (index_0/middle_0 at local +X~0.078m, thumb_0 at local +X~0.026m) and
+    # found the true cavity direction is mostly local +X.
+    # Follow-up (video review): pure midpoint under-weighted the thumb: biased
+    # 60/40 toward the thumb's curled position (thumb_1) instead of its
+    # uncurled mount (thumb_0), which also makes the Y-component (thumb curls
+    # toward opposite sides per hand) large enough to need a per-hand axis.
+    left_palm_grasp_axis: [0.9717, -0.2356, -0.0181]
+    right_palm_grasp_axis: [0.9717, 0.2359, 0.0155]
+    palm_grasp_point_offset: 0.0464
+    # Keep the oriented reach target behind the physical handle. The target
+    # frame moves with the bin, so this remains 4 cm away as the bin rotates.
+    # 0.04 -> 0.02 -> 0.04 (2026-08-24/27): tried halving to relieve wrist_roll
+    # margin (see measure_vert_joint_margin.py finding below). Isolated ablation
+    # (standoff-only, 100 iters, resumed from step 013075) showed it reproduces
+    # NEITHER the vertical improvement NOR the horizontal regression the combined
+    # run showed -- essentially inert on its own. Reverted to original; the real
+    # effect (both the vertical win and the right-hand regression) traces to the
+    # close-trigger widening below, confirmed by a matching close-trigger-only
+    # ablation. Keeping this comment rather than deleting -- the wrist_roll
+    # margin finding itself is still real, just not fixed by this lever.
+    grasp_target_standoff: 0.04
+    grasp_target_height_offset: 0.01
+    # Do not snapshot a REACH pose into the GRASP curriculum while either palm
+    # face points away from bin-down. A zero threshold is deliberately lenient:
+    # it rejects dorsal contact without demanding the final grasp orientation.
+    reach_transition_alignment_threshold: 0.0
+    # Contact is useful only on the anatomical palm side. Alignment reward
+    # remains dense below this threshold so the policy can rotate into place.
+    grasp_contact_alignment_threshold: 0.0
+    grasp_palm_alignment_threshold: 0.5
+    grasp_transition_hold_steps: 8
+    push_grasp_loss_grace_steps: 10
+    # 2026-08-30: force floor (Newtons, summed across index_1/middle_1/thumb_2
+    # per hand) for _grasp_force_sustained_mask -- the PUSH-stage grip-quality
+    # check gating the grasp-loss termination clock above (see that method's
+    # docstring in bin_push_homie.py and GRASP_FLOW_SUGGESTIONS_2026-08-30.md
+    # hypothesis #1). Grounded in measure_fingertip_force.py's real output
+    # (checkpoint model_step_014400, 256 envs x 300 steps, PUSH-stage steps
+    # already "valid" by proximity): min(left,right) force distribution was
+    # p10=3.38N, p25=7.25N, median=10.78N, p75=14.97N -- NOT the near-zero
+    # single-light-touch pattern this measurement was originally expected to
+    # find (only ~0.3-1.1% of samples were exactly zero force). 5.0N chosen
+    # as a moderate first correction (matches this project's established
+    # convention, e.g. grasp_bar_distance's own staged 3.0->6.0->9.0 history):
+    # sits right at a natural breakpoint in the measured candidate-threshold
+    # table (>5.00N passed 84.64% of currently-valid PUSH steps, a real but
+    # not drastic bite -- ~15% of currently-"valid" steps would newly start
+    # the grace-period clock), rather than the much stricter median (10.78N,
+    # ~50% bite) or the near-inert original 1.0N guess. Watch push_valid_
+    # grasp_frac_s3 alongside a new force-sustained-frac metric once tested --
+    # if this floor turns out too strict/loose relative to what actually
+    # correlates with real bin displacement, retune from there.
+    grasp_force_sustained_floor: 5.0
+    # 2026-08-30: NEW explicit override, was previously relying on the code's
+    # 5.0N fallback default (bin_push_homie.py's own self.config.get(...,5.0))
+    # -- found via the SAME measure_fingertip_force.py run above that real
+    # per-hand fingertip force during PUSH-stage contact has a median of
+    # 14.5-15.1N (LEFT/RIGHT), 2-12x the old 5.0N clamp, with individual
+    # samples up to 48-62N. This means _reward_grasp_fingertip_curl's force
+    # term (left_tip_force/max_force, clamped to 1.0) has almost certainly
+    # been SATURATED for most real contact this whole project -- any force
+    # beyond 5N produced zero additional reward, hiding whatever gradient
+    # existed between "barely touching" and "gripping hard." Raised to 15.0N
+    # (~= the measured per-hand median) so the reward actually discriminates
+    # across the real operating range instead of saturating almost
+    # immediately on contact. Independent from grasp_force_sustained_floor
+    # above (different purpose: this caps REWARD credit, that gates PUSH-
+    # stage SURVIVAL) -- deliberately different magnitudes, not a typo.
+    grasp_fingertip_curl_force_max: 15.0
+    # In GRASP, keep each hand open until it is near, anatomically oriented,
+    # and touching the bin. This prevents the stage transition from acting as
+    # an unconditional "close now" command.
+    # Run 19 (2026-08-01): replaced the isotropic 0.07m 3D `grasp_finger_close_dist`
+    # with decomposed horizontal/vertical tolerances. An isotropic sphere let a
+    # hand floating directly ABOVE the target (pure vertical offset) pass the
+    # same check as one truly centered on the rim — exactly the bug the video
+    # review caught (left palm closing fingers ~7cm above the true handle).
+    # Both must now pass, so closing requires genuine descent, not just a nearby
+    # 3D point in any direction.
+    # 2026-08-24: the vertical tensorboard trend (grasp_left/right_vert_ok_frac_s2)
+    # plateaued at ~5cm abs error for 150+ iterations post-resume, well above the
+    # old 3cm gate -- fingers were essentially never triggered to close at all, so
+    # grasp_full_pose_valid_frac_s2 stayed exactly 0.0 the whole run. Widened to
+    # trigger closing earlier/looser (real headroom above the observed plateau,
+    # not just barely past it) so the policy can actually start completing grasps
+    # and reaching PUSH -- addresses the "fingers close only once flat on the lid
+    # top, nothing left to curl around" failure mode from video review, separate
+    # from (complementary to) the standoff change above. horiz nudged too since
+    # the right hand's horiz_ok was still climbing (58-63%), not yet a limiter.
+    # 2026-08-27: reverted to original 0.04/0.03 -- the 0.05/0.06 widening
+    # above was tuned for the removed finger-close-trigger override (see
+    # _finger_close_ready / _postprocess_delta_actions), which no longer
+    # gates any real control (fingers are now under full continuous policy
+    # control; this and _finger_close_ready feed diagnostic logging only).
+    # Reverted rather than left at the now-arbitrary widened value, for a
+    # clean baseline against historical diagnostic numbers.
+    grasp_finger_close_horiz_dist: 0.04
+    grasp_finger_close_vert_dist: 0.03
+    # Wider than the hard gate so shaping remains useful at 8-11 cm error. The
+    # 4:3 width ratio mirrors the close gate while 8/6 cm gives a smooth lead-in.
+    grasp_target_anisotropic_horiz_std: 0.08
+    grasp_target_anisotropic_vert_std: 0.06
+    grasp_finger_close_alignment: 0.2
+    # Pregrasp finger pre-shaping. Written 2026-08-27 as a CONTROL-TIME
+    # override input (blends the finger primitive scalar from open toward
+    # closed as each palm approaches, capped at pregrasp_curl_max_fraction
+    # so it never neared full closure before a separate close-trigger fired)
+    # -- went obsolete the same day when the override functions it fed were
+    # removed to let the policy control fingers continuously. Sat
+    # disconnected for ~2 days.
+    #
+    # 2026-08-29: RECONNECTED as a REWARD TARGET for
+    # grasp_finger_dof_pos_l1 instead (bin_push_homie.py's
+    # _pregrasp_curl_fraction / _reward_grasp_finger_dof_pos_l1 docstrings
+    # have the full history) -- per user request after ~5 runs of video
+    # review showed fingers landing flat on the bin's lid, plausibly because
+    # the unconditional-p1 target couldn't distinguish "closing at the bar"
+    # from "closing while blocked flat on the lid". The new version removes
+    # the max_fraction CAP entirely (target now reaches full closure at
+    # zero distance, not a partial hand-off to something else) and switches
+    # from the offset hover target to the raw bar distance -- so
+    # pregrasp_curl_max_fraction below is now UNUSED/obsolete, left for the
+    # record. enable_pregrasp_curl still gates the whole mechanism: True
+    # (current) = graded target; False = falls back to the old unconditional
+    # p1 target.
+    enable_pregrasp_curl: True
+    pregrasp_curl_start_dist: 0.15
+    # OBSOLETE as of 2026-08-29 -- no longer read (see comment above).
+    pregrasp_curl_max_fraction: 0.3
+    # Twist about the palm-down axis (not covered by grasp_finger_close_alignment,
+    # which only checks the face-normal). ~60deg tolerance; the twist reward
+    # below supplies the dense gradient to close this before the gate matters.
+    grasp_finger_close_max_twist_rad: 1.0472
+    # Continuous grasp-readiness alternative (2026-08-27, prototype, OFF by
+    # default -- the 5-condition AND-gate above stays the LIVE path unless
+    # this is True). Replaces the AND of 5 hard per-axis thresholds with a
+    # PRODUCT of smooth terms on the same quantities, so partial credit on
+    # every axis compounds into one score instead of being zeroed out by
+    # whichever single axis is currently worst. See _grasp_readiness_score()
+    # and _finger_close_ready()'s docstrings in bin_push_homie.py. Consider
+    # enabling if the current close-trigger-widening + curl run doesn't
+    # resolve the left/right asymmetry and axis-hopping-bottleneck pattern.
+    enable_continuous_grasp_readiness: False
+    grasp_readiness_threshold: 0.5
+    # Sigma/scale widths default (in code) to the hard-threshold values above
+    # if left unset here -- only override if the readiness curve needs to be
+    # wider/narrower than the original hard cutoffs.
+    # grasp_readiness_horiz_sigma: 0.05
+    # grasp_readiness_vert_sigma: 0.06
+    # grasp_readiness_twist_sigma: 1.0472
+    # grasp_readiness_align_scale: 0.2
+    # Dense shaping for twist alignment about the palm-down axis (full quaternion
+    # error to the authored, cross-assigned, mirrored target rotation). std in
+    # radians; ~0.6 rad (34deg) gives a real gradient across the range IK found
+    # feasible without demanding exact 6D (July 27 finding: exact 6D is
+    # unnecessarily strict for the arms alone at this standoff).
+    # Run 21 (2026-08-04): measured checkpoint 4500 sitting at 115-138deg twist
+    # error, 3-4 std beyond 0.6 rad — reward and gradient both ~dead there.
+    # Widened 0.6->1.2 rad (69deg) so there's real pull from the current
+    # operating point; grasp_finger_close_max_twist_rad (the hard gate, not a
+    # shaping term) stays at its existing tighter 60deg tolerance.
+    palm_twist_std: 1.2
+    # 2026-08-27: superseded, no longer read -- _reward_grasp_finger_dof_pos_l1
+    # now unconditionally targets p1 the whole GRASP+PUSH span (matching
+    # doorman's design), so there's no more precontact-scaled-down phase for
+    # this to weight. Left here rather than deleted.
+    grasp_precontact_open_reward_scale: 0.5
+    # Require a stable, centered pre-grasp before creating a GRASP snapshot.
+    reach_transition_hold_steps: 5
+
+    # Push progress blends useful forward velocity with durable displacement.
+    push_target_vel: 0.30
+    push_velocity_weight: 0.50
+
+    # TIGHT walk_to_bin taper (Run 9): stops the inward creep past the stop target.
+    # Distance to stop target; full walk reward beyond _far, linear to 0 at _near.
+    # Robot spawns ~2m out so walk is FULL for the whole approach; only yields in
+    # the last ~0.2m where stop_at_bin takes over. (Run 4's taper was 0.5-1.2m —
+    # far too broad, damped the whole approach. This is deliberately tight+close.)
+    walk_taper_near: 0.25  # m to stop target: walk reward = 0 at/inside this
+                           # (0.4 -> 0.25, Run 10: at 0.4 walk died too FAR from the
+                           # target, so the robot lost forward drive and parked ~0.22m
+                           # short (0.70m from handles). Lowering near keeps walk
+                           # pushing until 0.25m from target, then the (now sharper)
+                           # stop_at_bin pulls the last bit onto the dot. Still dies
+                           # before the target so it can't creep past like Run 8.)
+    walk_taper_far: 0.6    # m to stop target: walk reward = full beyond this
+    # stop_pos_std (Run 11): 0.15 was OVER-sharpened — stop_at_bin earned only ~0.0016
+    # (effectively dead), giving near-zero learning signal until the robot was already
+    # on the dot, which it never reached. Result: it parked ~0.6m out farming reach.
+    # Widened to 0.20 so stop_at_bin gives a real, useful gradient from where the robot
+    # actually is (~0.6m) that pulls it inward. (0.25->0.15->0.20 = settling on a middle
+    # value that both pulls-onto-target AND provides signal from a distance.)
+    stop_pos_std: 0.20     # position gaussian std — pull toward target w/ real gradient
+    # stop_vel_std 0.2 -> 0.1 (Run 7): at 0.2 the robot banked ~40% of the stop
+    # reward while cruising at 0.27 m/s — too soft to force a true stop. Sharpened
+    # so cruising banks ~2% and there's a steep gradient toward zero velocity. (The
+    # 0.1 that was "unearnably tight" before was multiplied by a BAD bin-centered
+    # position term; with the grasp-relative stop target it's now appropriate.)
+    stop_vel_std: 0.1      # velocity gaussian std — sharp gradient toward 0 vel
+    # stop_lat_std 0.08 -> 0.15 (ISO5): 0.08 was OVER-tightened — too tight to give a
+    # gradient from where the robot stood (0.22m off-center), so stop_at_bin went dead
+    # (~0.004) and centering got WORSE. 0.15 still meaningfully tighter than the
+    # along-axis 0.20 (so it prefers centered) but gives a real pull from ~0.2m out.
+    stop_lat_std: 0.15     # LATERAL stop gaussian std (perp to approach) — center up
+    stop_reward_mode: product
+    stop_reward_additive_weights: [0.4, 0.4, 0.2]
+    stage_advance_vel: 0.2 # APPROACH->REACH: pelvis speed must be below this to
+                           # advance (was 0.3; robot cruised at 0.27 and never settled)
+
+    # 4 stages: APPROACH, REACH, GRASP, PUSH
+    max_stage_time: [200, 100, 80, 300]
+    award_remaining_time_on_advance: True
+    accumulate_stage_reward: False
+    reset_on_complete: True
+    reset_on_complete_delay: 30.0
+    reset_on_overtime: True
+    stage_reward_scale: [1.0, 1.0, 1.0, 1.5]
+
+    delta_action_indices: [
+      0, 1, 2,                                       # homie command (vx, vy, yaw)
+      3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,  # upper body
+      17, 18                                          # finger primitives
+    ]
+    delta_action_scale: 0.3
+    delta_action_clip: 15.0
+    # Generic backmapping reads stale/pre-refresh state during staged reset.
+    # Finger targets are synchronized explicitly by BinPushHomie instead.
+    reset_delta_actions_with_backmap: False
+    left_finger_delta_action_index: 17
+    right_finger_delta_action_index: 18
+
+    warped_action:
+      indices: [0, 1, 2]
+      k: 0.0
+      s: 0.0
+
+    enable_staged_reset: True
+    # PUSH must be reached through a sustained valid grasp. Replaying PUSH
+    # snapshots hid grasp loss and inflated stage occupancy.
+    staged_reset_ratios: [0.4, 0.4, 0.2, 0.0]
+    staged_reset_max_samples_per_stage: 200
+    # Saving the full replay tensor would add several GB per checkpoint. Four
+    # recent samples per env still provides 16k diverse snapshots at 4096 envs.
+    staged_reset_checkpoint_samples_per_stage: 4
+
+    resting_dof_pos: [
+      -0.1, 0, 0, 0.3, -0.2, 0,                     # l hip knee ankle
+      -0.1, 0, 0, 0.3, -0.2, 0,                     # r hip knee ankle
+      0, 0, 0,                                       # waist
+      0.261799, 0.174533, 0, 0.261799,               # l shoulder elbow
+      1.5708, 0, 0,                                  # l wrist
+      0.261799, -0.174533, 0, 0.261799,              # r shoulder elbow
+      -1.5708, 0, 0,                                 # r wrist
+      -1.0472, -1.0472, 0,                           # l hand 0
+      1.0472, 1.0472, 0,                             # r hand 0
+      -0.523599, -0.523599, 0,                       # l hand 1
+      0.523599, 0.523599, 0,                         # r hand 1
+      0.523599, -0.523599                            # lr thumb 2
+    ]
+
+    clip_homie_command: True
+    clip_homie_linvel_x_threshold: 0.5
+    clip_homie_linvel_y_threshold: 0.5
+    clip_homie_angvel_threshold: 0.5
+    clip_homie_lower_height_threshold: 0.15
+    clip_homie_upper_height_threshold: 0.75
+    clip_homie_torso_roll_lower_threshold: -0.5
+    clip_homie_torso_roll_upper_threshold: 0.5
+    clip_homie_torso_pitch_lower_threshold: -0.5
+    clip_homie_torso_pitch_upper_threshold: 0.5
+    clip_homie_torso_yaw_lower_threshold: -0.5
+    clip_homie_torso_yaw_upper_threshold: 0.5
+    homie_command_scale: 0.25
+
+    termination_curriculum:
+      level_down_ave_goal_reached_rate: 0.5
+      level_up_ave_goal_reached_rate: 0.7
+      # -0.0001 -> +0.0001 (2026-08-30): the negative sign made this run
+      # BACKWARDS relative to its own level_down/level_up naming -- below 50%
+      # success the level would GROW (not decay/help), above 70% it would
+      # DECAY (not grow) toward min_level, loosening the DOF-overspeed
+      # termination threshold (bin_push_homie.py:~2950) exactly when success
+      # starts becoming real. Found in GRASP_FLOW_DEEP_REVIEW_CRITIQUE_2026-
+      # 08-30.md, confirmed mathematically inert for this project's entire
+      # history so far (average_goal_reached, i.e. full task completion, has
+      # never exceeded ~0%, so the only-ever-active branch under the OLD sign
+      # -- initial==max==1.0, so "grow" was already a permanent no-op -- never
+      # fired either) -- see GRASP_FLOW_SUGGESTIONS_2026-08-30.md hypothesis
+      # #2 for the full analysis. Free fix, behaviorally invisible until
+      # completion rate actually starts climbing, at which point the old sign
+      # would have started silently loosening termination right when it
+      # mattered most.
+      degree: 0.0001
+      min_level: 0.1
+      max_level: 1.0
+      initial_level: 1.0
+
+# Globally accessible parameters
+log_task_name: bin_push
