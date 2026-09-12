@@ -16,6 +16,7 @@ obs:
       privileged_bin_info,
       delta_actions,
       hand_bin_handle_transform,
+      hand_bar_transform,
       unwarped_actions,
 
       b_homie_commands
@@ -35,6 +36,7 @@ obs:
       privileged_bin_info,
       delta_actions,
       hand_bin_handle_transform,
+      hand_bar_transform,
       unwarped_actions,
 
       transition,
@@ -72,6 +74,7 @@ obs:
       privileged_bin_info: 15,
       delta_actions: 15,
       hand_bin_handle_transform: 15,
+      hand_bar_transform: 15,
 
       transition: 15,
       complete: 15,
@@ -103,6 +106,7 @@ obs:
       privileged_bin_info: 2,
       delta_actions: 2,
       hand_bin_handle_transform: 2,
+      hand_bar_transform: 2,
 
       transition: 2,
       complete: 2,
@@ -128,6 +132,7 @@ obs:
     privileged_bin_info: 1.0,
     delta_actions: 1.0,
     hand_bin_handle_transform: 1.0,
+    hand_bar_transform: 1.0,
     unwarped_actions: 1.0,
 
     transition: 1.0,
@@ -161,6 +166,7 @@ obs:
     privileged_bin_info: 0.0,
     delta_actions: 0.0,
     hand_bin_handle_transform: 0.0,
+    hand_bar_transform: 0.0,
     unwarped_actions: 0.0,
 
     transition: 0.0,
@@ -197,6 +203,10 @@ obs:
     - stage: ${eval:'len(${env.config.max_stage_time})'}
     - privileged_bin_info: 6
     - hand_bin_handle_transform: 18
+    # [grasppoint->bar error xyz (3), bar rot 6d (6)] per hand, palm frame.
+    # See _get_obs_hand_bar_transform: this is the quantity the grasp gate
+    # actually scores, which the teacher previously could not observe.
+    - hand_bar_transform: 18
     - b_homie_commands: 7
     - e_homie_dof_pos: ${robot.homie_dof_obs_size}
     - f_homie_dof_vel: ${robot.homie_dof_obs_size}
@@ -211,14 +221,41 @@ obs:
     - delta_actions: ${eval:'len(${env.config.delta_action_indices})'}
     - unwarped_actions: ${eval:'len(${env.config.warped_action.indices})'}
 
+  # 2026-09-12: 'height' and 'pitch' moved into the ACTIVE command set (they
+  # were previously pinned at their defaults for the whole episode -- 0.74m
+  # pelvis height, zero torso lean -- because they were absent from
+  # homie_command_keys and so fell through to homie_command_default).
+  #
+  # Why: the handles sit at ~0.858m and stop_standoff holds the pelvis 0.46m
+  # back, while penalty_too_close_to_bin / approach_min_standoff actively forbid
+  # stepping closer. That put the grasp at near-full arm extension, which is the
+  # worst regime for wrist orientation authority -- and palm-down alignment is
+  # exactly what was failing (grasp_left_palm_down_s2 declining to 0.064). A
+  # human lowers the handle by leaning in and dropping the hips; the policy had
+  # no way to. The frozen HOMIE lower-body policy already accepts both commands
+  # (b_homie_commands is 7-dim and the clip thresholds for height/roll/pitch/yaw
+  # in the env config were already defined and unused).
+  #
+  # 'rpy' is split into per-axis entries so pitch can be active while roll and
+  # yaw stay pinned at zero -- torso yaw is redundant with the loco yaw command
+  # and roll has no role in a symmetric two-handed reach.
+  #
+  # ACTION COLUMN ORDER is this dict's iteration order, filtered to the keys in
+  # homie_command_keys, so the policy's 21 outputs now map as:
+  #   0,1,2 = loco vx,vy,yaw | 3 = height | 4 = torso pitch
+  #   5..11 = left arm | 12..18 = right arm | 19 = left hand | 20 = right hand
+  # delta_action_indices and left/right_finger_delta_action_index in
+  # config/env/bin_push_homie.yaml must stay consistent with that.
   homie_command_keys: {
-    'loco_vel', 'left_arm', 'right_arm', 'left_hand', 'right_hand'
+    'loco_vel', 'height', 'pitch', 'left_arm', 'right_arm', 'left_hand', 'right_hand'
   }
 
   homie_command_default: {
     'loco_vel': [0.0, 0.0, 0.0],
     'height': [0.0],
-    'rpy': [0.0, 0.0, 0.0],
+    'roll': [0.0],
+    'pitch': [0.0],
+    'yaw': [0.0],
     'left_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     'right_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     'left_hand': [0.0],
@@ -228,7 +265,9 @@ obs:
   homie_command_index: {
     'loco_vel': [0, 1, 2],
     'height': [3],
-    'rpy': [4, 5, 6],
+    'roll': [4],
+    'pitch': [5],
+    'yaw': [6],
     'left_arm': [7, 8, 9, 10, 11, 12, 13],
     'right_arm': [14, 15, 16, 17, 18, 19, 20],
     'left_hand': [21],

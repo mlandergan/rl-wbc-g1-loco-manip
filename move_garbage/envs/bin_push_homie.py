@@ -396,8 +396,9 @@ class BinPushHomie(
             self.log_dict[f"stage_{stage}_frac"] = (self.stage_buf == stage).float().mean()
 
         left_palm, right_palm = self._palm_grasp_points()
-        left_delta = self._left_handle_target() - left_palm
-        right_delta = self._right_handle_target() - right_palm
+        ref_left, ref_right = self._grasp_reference_targets()
+        left_delta = ref_left - left_palm
+        right_delta = ref_right - right_palm
         left_dist = left_delta.norm(dim=-1)
         right_dist = right_delta.norm(dim=-1)
         both_close = (left_dist < 0.15) & (right_dist < 0.15)
@@ -549,6 +550,66 @@ class BinPushHomie(
         left_bar_dists, right_bar_dists = self._hand_bar_distances()
         self.log_dict["grasp_left_bar_dist_s2"] = left_bar_dists[contact_mask].mean()
         self.log_dict["grasp_right_bar_dist_s2"] = right_bar_dists[contact_mask].mean()
+
+        # --- SINGLE SOURCE OF TRUTH: every hand-to-handle distance, side by side
+        # (2026-09-12). Added because the project spent ~5 runs tuning against
+        # two silently different reference points (see _grasp_reference_targets).
+        # Every metric below is named <from>_to_<to>, so which point a number
+        # refers to is never ambiguous again:
+        #   grasppoint = _palm_grasp_points() (palm link + palm_grasp_point_offset
+        #                along the finger-cavity axis) -- what rewards/gates score
+        #   palmlink   = raw palm_link origin -- what the old obs reported
+        #   bar        = _left/right_bar_raw_pos() -- the true bar, the thing to grasp
+        #   hover      = _left/right_handle_target() -- REACH waypoint, bar + offset
+        # `dist_hover_to_bar` is a geometric constant (grasp_target_standoff +
+        # height_offset, ~0.0412) and exists purely as a sanity check: if it ever
+        # drifts, a transformer offset changed underneath us.
+        left_hover, right_hover = self._left_handle_target(), self._right_handle_target()
+        left_bar, right_bar = self._left_bar_raw_pos(), self._right_bar_raw_pos()
+        left_palm_link = self.simulator._rigid_body_pos[:, self.left_palm_idx, :]
+        right_palm_link = self.simulator._rigid_body_pos[:, self.right_palm_idx, :]
+        for side, gp, plink, hover, bar in (
+            ("left", left_palm, left_palm_link, left_hover, left_bar),
+            ("right", right_palm, right_palm_link, right_hover, right_bar),
+        ):
+            gp_to_bar = bar - gp
+            self.log_dict[f"dist_{side}_grasppoint_to_bar_s2"] = (
+                gp_to_bar.norm(dim=-1)[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_grasppoint_to_bar_horiz_s2"] = (
+                gp_to_bar[:, :2].norm(dim=-1)[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_grasppoint_to_bar_vert_s2"] = (
+                gp_to_bar[:, 2].abs()[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_grasppoint_to_hover_s2"] = (
+                (hover - gp).norm(dim=-1)[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_palmlink_to_bar_s2"] = (
+                (bar - plink).norm(dim=-1)[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_hover_to_bar_s2"] = (
+                (bar - hover).norm(dim=-1)[contact_mask].mean()
+            )
+
+        # Distribution of the GRADED distance (worse hand), so grasp_bar_valid_dist
+        # can be retuned from data instead of a guess -- the previous 0.03 -> 0.08
+        # retune was measured against the mis-referenced target and mostly encoded
+        # the size of the offset bug rather than what the arm can actually reach.
+        worst_bar_dist = torch.maximum(left_bar_dists, right_bar_dists)[contact_mask]
+        self.log_dict["dist_worst_grasppoint_to_bar_min_s2"] = worst_bar_dist.min()
+        for q in (0.1, 0.25, 0.5):
+            self.log_dict[f"dist_worst_grasppoint_to_bar_p{int(q * 100)}_s2"] = (
+                torch.quantile(worst_bar_dist, q)
+            )
+        valid_dist = float(self.config.get("grasp_bar_valid_dist", 0.05))
+        for probe in (0.03, 0.04, 0.05, 0.06, 0.08, 0.10):
+            self.log_dict[f"dist_worst_under_{int(probe * 100):02d}cm_frac_s2"] = (
+                (worst_bar_dist < probe).float().mean()
+            )
+        self.log_dict["dist_worst_under_gate_frac_s2"] = (
+            (worst_bar_dist < valid_dist).float().mean()
+        )
         # 2026-08-30: per GRASP_FLOW_SUGGESTIONS_2026-08-30.md hypothesis #3's
         # "concrete next check" -- logging _pregrasp_curl_fraction() alongside
         # bar_dist above, so it's directly visible whether the
@@ -683,6 +744,42 @@ class BinPushHomie(
             [left_hand_pos, left_hand_rot_6d, right_hand_pos, right_hand_rot_6d], dim=-1
         )
 
+    def _get_obs_hand_bar_transform(self):
+        """Per-hand pose of the RAW bar relative to that hand's virtual grasp
+        point, in the palm-link frame: [err_xyz (3), bar_rot_6d (6)] x 2 = 18.
+
+        2026-09-12: the teacher previously could not observe the quantity it is
+        graded on. `hand_bin_handle_transform` reports the OFFSET hover target
+        relative to the palm LINK origin, while the grasp gate scores
+        `_palm_grasp_points` (4.64cm out along the finger cavity, per
+        palm_grasp_point_offset) against `_left/right_bar_raw_pos`. Two
+        different source points and two different targets, so the observed
+        "zero error" and the rewarded "zero error" were ~4-9cm apart depending
+        on palm orientation -- recoverable in principle for a privileged
+        teacher, but there was no reason to make it infer a transform we can
+        just hand it.
+
+        err_xyz is exact, not approximated: `_palm_grasp_points` offsets the
+        palm link origin by `offset * axis` expressed in the palm's own local
+        frame, so subtracting that same vector from the bar transformer's
+        palm-frame reading gives the grasp-point-to-bar error directly.
+        """
+        offset = float(self.config.get("palm_grasp_point_offset", 0.0464))
+        left_axis, right_axis = self._palm_grasp_axes()
+        left_sensor = self.simulator.scene.sensors["left_hand_bar_frame_transformer"]
+        right_sensor = self.simulator.scene.sensors["right_hand_bar_frame_transformer"]
+        left_err = left_sensor.data.target_pos_source[:, 0, :] - offset * left_axis
+        right_err = right_sensor.data.target_pos_source[:, 0, :] - offset * right_axis
+        left_rot_6d = quat_to_tan_norm(
+            wxyz_to_xyzw(left_sensor.data.target_quat_source[:, 0, :]), w_last=True
+        )
+        right_rot_6d = quat_to_tan_norm(
+            wxyz_to_xyzw(right_sensor.data.target_quat_source[:, 0, :]), w_last=True
+        )
+        return torch.cat(
+            [left_err, left_rot_6d, right_err, right_rot_6d], dim=-1
+        )
+
     def _get_obs_hand_force(self):
         left_hand_force = self.simulator.contact_forces[:, self.left_hand_indices, :]
         right_hand_force = self.simulator.contact_forces[:, self.right_hand_indices, :]
@@ -776,6 +873,40 @@ class BinPushHomie(
             .data.target_pos_w[:, 0, :]
             .clone()
         )
+
+    def _grasp_reference_targets(self):
+        """Single source of truth for the point GRASP-stage geometry is measured
+        against. Returns (left, right) world positions.
+
+        2026-09-12: every GRASP-stage reward, hard gate and diagnostic log used
+        `_left/right_handle_target` -- the pre-contact HOVER point, offset from the
+        bar by grasp_target_standoff (4cm, along the bin's push axis) plus
+        grasp_target_height_offset (1cm) -- while the validity gate
+        (`_grasp_pose_valid_mask` via `_hand_bar_distances`) used
+        `_left/right_bar_raw_pos`. Both measure FROM the same point
+        (`_palm_grasp_points`), so the two disagreed by a fixed ~4.1cm that is
+        almost entirely horizontal.
+
+        That made the gate arithmetically unreachable, which is why
+        `stage_3_frac` and `grasp_full_pose_valid_frac_s2` were identically 0.0
+        for the whole project: at the end of the best run the policy had
+        converged the palm grasp point to 5.8cm of the hover point
+        (grasp_left_horiz_s2 0.047, grasp_left_abs_vert_s2 0.033) while sitting
+        9.6cm from the bar (grasp_left_bar_dist_s2) against an 0.08 threshold.
+        The 4cm residual is exactly grasp_target_standoff. It also explains why
+        vertical converged (1cm offset) and horizontal did not (4cm offset), and
+        why the isolated standoff ablation read as inert -- shrinking the offset
+        alone left 15.0 of reward weight still pulling to the hover point
+        against 21.0 pulling to the bar.
+
+        REACH deliberately keeps the hover target: the offset is a genuine
+        pre-contact waypoint there, and the pregrasp arc is built around it. The
+        stage boundary is now a real 4cm "close the last gap onto the bar" step
+        rather than two rewards disagreeing about where the bar is.
+        """
+        if bool(self.config.get("grasp_use_raw_bar_reference", True)):
+            return self._left_bar_raw_pos(), self._right_bar_raw_pos()
+        return self._left_handle_target(), self._right_handle_target()
 
     def _left_handle_target_rot(self):
         """World-frame target orientation (xyzw) for the left palm."""
@@ -1057,12 +1188,9 @@ class BinPushHomie(
 
         left_dist, right_dist = self._hand_bar_distances()
         left_palm, right_palm = self._palm_grasp_points()
-        left_close = (
-            left_palm - self._left_handle_target()
-        ).norm(dim=-1) < transition_dist
-        right_close = (
-            right_palm - self._right_handle_target()
-        ).norm(dim=-1) < transition_dist
+        ref_left, ref_right = self._grasp_reference_targets()
+        left_close = (left_palm - ref_left).norm(dim=-1) < transition_dist
+        right_close = (right_palm - ref_right).norm(dim=-1) < transition_dist
         left_closed = (
             self.simulator.dof_pos[:, self._left_hand_dof_idx] - self._left_p1
         ).abs().mean(dim=-1) < finger_threshold
@@ -1123,8 +1251,9 @@ class BinPushHomie(
         left_palm, right_palm = self._palm_grasp_points()
         left_alignment, right_alignment = self._palm_down_alignments()
         left_twist, right_twist = self._palm_twist_errors()
-        left_delta = self._left_handle_target() - left_palm
-        right_delta = self._right_handle_target() - right_palm
+        ref_left, ref_right = self._grasp_reference_targets()
+        left_delta = ref_left - left_palm
+        right_delta = ref_right - right_palm
 
         def _score(delta, alignment, twist, bar_dist):
             horiz_err = delta[:, :2].norm(dim=-1)
@@ -1189,8 +1318,9 @@ class BinPushHomie(
         left_alignment, right_alignment = self._palm_down_alignments()
         left_twist, right_twist = self._palm_twist_errors()
 
-        left_delta = self._left_handle_target() - left_palm
-        right_delta = self._right_handle_target() - right_palm
+        ref_left, ref_right = self._grasp_reference_targets()
+        left_delta = ref_left - left_palm
+        right_delta = ref_right - right_palm
         left_horiz_ok = left_delta[:, :2].norm(dim=-1) < close_dist_horiz
         left_vert_ok = left_delta[:, 2].abs() < close_dist_vert
         right_horiz_ok = right_delta[:, :2].norm(dim=-1) < close_dist_horiz
@@ -2159,8 +2289,9 @@ class BinPushHomie(
     def _reward_grasp_target_distance(self):
         """Both palms close to their handle targets. Averaged L+R Gaussian."""
         lp, rp = self._palm_grasp_points()
-        ld = torch.norm(self._left_handle_target() - lp, dim=-1)
-        rd = torch.norm(self._right_handle_target() - rp, dim=-1)
+        ref_left, ref_right = self._grasp_reference_targets()
+        ld = torch.norm(ref_left - lp, dim=-1)
+        rd = torch.norm(ref_right - rp, dim=-1)
         left = self._tracking_reward_util(ld, std=0.1, target=0.0, scale=1.0, offset=0.0)
         right = self._tracking_reward_util(rd, std=0.1, target=0.0, scale=1.0, offset=0.0)
         return 0.5 * (left + right)
@@ -2174,8 +2305,9 @@ class BinPushHomie(
         making vertical error more costly than the isotropic reward does.
         """
         lp, rp = self._palm_grasp_points()
-        ld = self._left_handle_target() - lp
-        rd = self._right_handle_target() - rp
+        ref_left, ref_right = self._grasp_reference_targets()
+        ld = ref_left - lp
+        rd = ref_right - rp
         horiz_std = float(
             self.config.get("grasp_target_anisotropic_horiz_std", 0.08)
         )
@@ -2214,8 +2346,9 @@ class BinPushHomie(
         _reward_palm_twist_progress.
         """
         lp, rp = self._palm_grasp_points()
-        left_vert_error = (self._left_handle_target() - lp)[:, 2].abs()
-        right_vert_error = (self._right_handle_target() - rp)[:, 2].abs()
+        ref_left, ref_right = self._grasp_reference_targets()
+        left_vert_error = (ref_left - lp)[:, 2].abs()
+        right_vert_error = (ref_right - rp)[:, 2].abs()
         max_step_error = float(self.config.get("grasp_vert_progress_norm", 0.3))
         valid = (self.episode_length_buf > 1).float()
         left_progress = (
@@ -2498,6 +2631,26 @@ class BinPushHomie(
             self._left_contact_mask = [i for i, n in enumerate(g1_hand_links) if "left_hand" in n]
             self._right_contact_mask = [i for i, n in enumerate(g1_hand_links) if "right_hand" in n]
 
+        # 2026-09-12: NORMALIZED to [-1, 1] per hand, then averaged across hands
+        # (was: raw Newtons per link, clamped +-10, MEAN over links, then SUMMED
+        # over both hands -- so the term's value was in force units while every
+        # other shaped reward in this file is a bounded [0,1] Gaussian/cosine).
+        # That scale mismatch, not the 5.0 weight, is why this became the
+        # dominant term in the whole reward stack: it earned a mean of 2.896
+        # while palm_down_alignment earned 0.051 (57x) and the policy visibly
+        # traded palm orientation away for contact force -- grasp_left_palm_
+        # down_s2 moved BACKWARDS 0.125 -> 0.064 over the run while this term
+        # climbed. Dividing by grasp_contact_force_norm puts a weight of N here
+        # on the same footing as a weight of N anywhere else in the file.
+        #
+        # Deliberately NOT re-gated on alignment or proximity: the commented
+        # block below is the history of two real bugs caused by exactly that
+        # (hard AND-gates on face-normal, then on decomposed proximity, both
+        # reinforced a physically-wrong wedge). Fixing the units is the
+        # narrower change; the alignment signal is raised on its own weight
+        # instead.
+        force_norm = float(self.config.get("grasp_contact_force_norm", 10.0))
+
         def _hand_force_reward(contact_mask, rot, axis):
             link_forces = forces[:, contact_mask, :]  # (num_envs, num_links, 3)
             num_links = link_forces.shape[1]
@@ -2507,12 +2660,12 @@ class BinPushHomie(
             axis_expand = axis[:, None, :].expand(-1, num_links, -1).reshape(-1, 3)
             outward = (force_palm_frame * axis_expand).sum(dim=-1)
             lateral = (force_palm_frame - outward[:, None] * axis_expand).norm(dim=-1)
-            reward = (outward - lateral).clamp(min=-10.0, max=10.0)
+            reward = ((outward - lateral) / force_norm).clamp(min=-1.0, max=1.0)
             return reward.reshape(self.num_envs, num_links).mean(dim=-1)
 
         left_reward = _hand_force_reward(self._left_contact_mask, left_rot, left_axis)
         right_reward = _hand_force_reward(self._right_contact_mask, right_rot, right_axis)
-        reward = left_reward + right_reward
+        reward = 0.5 * (left_reward + right_reward)
 
         in_reach = self.stage_buf == self.STAGE_REACH
         return torch.where(in_reach, -1.0 * torch.abs(reward), reward)
@@ -2968,11 +3121,46 @@ class BinPushHomie(
         # randomization below still overwrites those columns as before.
         self.target_robot_dof_state[env_ids, :, 0] = self.resting_dof_pos
 
+        # Optional pre-positioned arm pose (2026-09-12). When set, the 14 arm
+        # DOFs are seeded to an explicit configuration instead of resting_dof_pos
+        # (arms down), so an episode can begin with the palms already at the
+        # handles. Used by the reach/grasp isolation config to study the GRASP
+        # and PUSH rewards -- whether the policy lowers the handle and drives the
+        # bin the way a human does -- without first having to solve approach and
+        # reach. Left unset (None) for the normal task.
+        spawn_arm_dof_pos = self.config.get("spawn_arm_dof_pos", None)
+        if spawn_arm_dof_pos is not None:
+            arm_idx = torch.cat([self._left_arm_dof_idx, self._right_arm_dof_idx])
+            arm_pose = torch.tensor(
+                list(spawn_arm_dof_pos), device=self.device, dtype=torch.float32
+            )
+            assert arm_pose.numel() == arm_idx.numel(), (
+                f"spawn_arm_dof_pos has {arm_pose.numel()} entries, expected "
+                f"{arm_idx.numel()} (left arm 7 then right arm 7)"
+            )
+            xx, yy = torch.meshgrid(env_ids, arm_idx)
+            self.target_robot_dof_state[xx, yy, 0] = arm_pose[None, :]
+
+        # Reset randomization is blended toward resting_dof_pos by these factors
+        # (1.0 = the original full-range randomization, 0.0 = exactly resting).
+        # 2026-09-12: made configurable rather than fixed. Every episode was
+        # starting with wrists randomized across +-80deg and fingers across
+        # their ENTIRE joint range, which is a lot of initial-state noise for a
+        # task whose gate wants both palms held inside 4cm/3cm for
+        # grasp_transition_hold_steps consecutive steps. Default is unchanged;
+        # the reach/grasp isolation config narrows it.
+        wrist_scale = float(self.config.get("reset_wrist_random_scale", 1.0))
+        finger_scale = float(self.config.get("reset_finger_random_scale", 1.0))
+
         xx, yy = torch.meshgrid(env_ids, self.wrist_dof_idx)
-        self.target_robot_dof_state[xx, yy, 0] = torch_rand_float(
-            -1.39626, 1.39626,
-            (len(env_ids), len(self.wrist_dof_idx)),
-            device=str(self.device),
+        wrist_rest = self.resting_dof_pos[:, self.wrist_dof_idx]
+        self.target_robot_dof_state[xx, yy, 0] = wrist_rest + wrist_scale * (
+            torch_rand_float(
+                -1.39626, 1.39626,
+                (len(env_ids), len(self.wrist_dof_idx)),
+                device=str(self.device),
+            )
+            - wrist_rest
         )
 
         xx, yy = torch.meshgrid(env_ids, self.finger_dof_idx)
@@ -2982,10 +3170,14 @@ class BinPushHomie(
         lower_limit = torch.tensor(
             self.simulator.robot_config.dof_pos_lower_limit_list, device=str(self.device)
         )[None, self.finger_dof_idx]
-        self.target_robot_dof_state[xx, yy, 0] = lower_limit + (
+        finger_random = lower_limit + (
             upper_limit - lower_limit
         ) * torch_rand_float(
             0.0, 1.0, (len(env_ids), len(self.finger_dof_idx)), device=str(self.device)
+        )
+        finger_rest = self.resting_dof_pos[:, self.finger_dof_idx]
+        self.target_robot_dof_state[xx, yy, 0] = finger_rest + finger_scale * (
+            finger_random - finger_rest
         )
 
         self.target_robot_dof_state[env_ids, :, 1] = 0.0

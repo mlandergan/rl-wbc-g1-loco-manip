@@ -1,0 +1,59 @@
+# @package _global_
+#
+# Reach/grasp/push ISOLATION variant of bin_push_homie_lstm (2026-09-12).
+#
+# Spawns the robot already standing at the stop pose instead of ~2m back, so
+# training spends its samples on the part that is actually failing. The point is
+# to see how the GRASP and PUSH rewards behave once the approach is free --
+# specifically whether the policy lowers the handle and tips the bin onto its
+# wheels the way a human does, and whether it can drive the bin at all once it
+# has a grip.
+#
+# Not a replacement for the full task: a policy trained here has never learned to
+# walk up to the bin, and the staged-reset machinery is what normally provides
+# GRASP-stage starts. Treat it as a diagnostic/ablation, and keep the full
+# bin_push_homie_lstm run as the thing that ships.
+#
+# Usage: same invocation as bin_push_homie_lstm, with +exp=wbmanip/bin_push_homie_grasp_isolation
+
+defaults:
+  - /exp/wbmanip/bin_push_homie_lstm
+
+exp_var: grasp_isolation
+
+env:
+  config:
+    # Feet at the stop pose. stop_standoff is 0.46m back from the handle midpoint
+    # along the grasp-face normal; _reset_root_states already exposes
+    # spawn_x_range for exactly this experiment (its own comment cites
+    # [-0.5, -0.4] as the isolation value). Keeps the +-0.3m Y jitter and +-15deg
+    # yaw jitter from the normal spawn so the policy still has to centre itself.
+    spawn_x_range: [-0.52, -0.44]
+
+    # Narrow the reset noise on the joints that matter for a precision grasp.
+    # The default reset randomizes wrists across +-80deg and fingers across their
+    # ENTIRE joint range on every episode, which is a lot of starting noise for a
+    # gate that wants both palms held inside 4cm/3cm for 8 consecutive steps.
+    # 0.25 keeps real variation without starting every episode from a
+    # randomly-twisted wrist.
+    reset_wrist_random_scale: 0.25
+    reset_finger_random_scale: 0.25
+
+    # Reallocate the episode: APPROACH is nearly free now, so give the budget to
+    # GRASP (the bottleneck) and PUSH (the stage that has never once been
+    # entered, so its rewards have never been observed under real conditions).
+    max_stage_time: [60, 100, 160, 300]
+
+    # Staged reset normally supplies GRASP starts by replaying snapshots. Here the
+    # spawn already provides them, and replaying APPROACH snapshots would undo the
+    # isolation, so weight toward fresh starts at the stop pose.
+    staged_reset_ratios: [0.7, 0.3, 0.0, 0.0]
+
+    # Arms pre-positioned at the handles. UNSET until measured: this needs 14 arm
+    # joint angles (left 7 then right 7) that actually place both palm grasp
+    # points on the bars, which is an IK question about this specific asset and
+    # standoff -- scripts/probe_reach_grasp_feasibility.py is the existing tool
+    # for it and reportedly converges to 17-51deg twist error. Fill this in from
+    # that probe's output rather than guessing; a wrong pose would spawn the arms
+    # inside the bin geometry.
+    # spawn_arm_dof_pos: [...]

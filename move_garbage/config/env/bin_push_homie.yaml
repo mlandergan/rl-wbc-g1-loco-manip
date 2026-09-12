@@ -225,7 +225,24 @@ env:
     # that one gates an earlier, looser stage-advance readiness check
     # against the OFFSET hover target, not final grasp validity against the
     # raw bar.
-    grasp_bar_valid_dist: 0.08
+    # 2026-09-12: 0.08 -> 0.05, together with grasp_use_raw_bar_reference below.
+    # The 0.08 was honestly measured (measure_bar_dist.py on the finger_fix
+    # checkpoint: 63.2% of envs reached 0.08 at least once vs 0% at 0.03-0.06),
+    # but what it measured was the size of the reference-frame bug, not what the
+    # arm can reach: every GRASP reward was pulling the palm to a point 4cm away
+    # from the bar, so the palm's equilibrium distance TO the bar could never go
+    # below ~4cm no matter how well the policy optimized. With the rewards now
+    # referenced to the bar itself, 0.05 is a real "on the bar" test (bar radius
+    # plus slack for palm_grasp_point_offset's own calibration uncertainty).
+    # RETUNE FROM DATA, not from a guess: the new dist_worst_under_*cm_frac_s2
+    # metrics log the achieved distribution at 3/4/5/6/8/10cm every iteration.
+    grasp_bar_valid_dist: 0.05
+    # Make the raw bar the single reference for all GRASP-stage geometry (reward,
+    # hard gates, logs). False restores the pre-2026-09-12 behaviour where
+    # rewards chased the offset hover point while the gate scored the raw bar --
+    # kept as a switch only so the change can be A/B'd, not because the old path
+    # is correct. See _grasp_reference_targets in bin_push_homie.py.
+    grasp_use_raw_bar_reference: True
     grasp_transition_dist: 0.10
     grasp_finger_closed_threshold: 0.174533
     # Anatomical palm-side directions, matching the side the fingers curl toward.
@@ -306,6 +323,16 @@ env:
     # above (different purpose: this caps REWARD credit, that gates PUSH-
     # stage SURVIVAL) -- deliberately different magnitudes, not a typo.
     grasp_fingertip_curl_force_max: 15.0
+    # 2026-09-12: per-link force normalizer for _reward_grasp_contact, which
+    # until now returned raw Newtons (per-link clamp +-10N, mean over the 8
+    # links, SUMMED over both hands) while every other shaped term in this task
+    # returns a bounded [0,1] Gaussian/cosine. That made its effective weight
+    # ~50x its nominal 5.0: it earned a mean of 2.896 against
+    # palm_down_alignment's 0.051, and the policy traded palm orientation away
+    # to farm it. 10.0 matches the existing per-link clamp, so a hand with every
+    # link loaded outward at >=10N now scores 1.0 and "weight 3.0" means the
+    # same thing here as anywhere else in the reward file.
+    grasp_contact_force_norm: 10.0
     # In GRASP, keep each hand open until it is near, anatomically oriented,
     # and touching the bin. This prevents the stage transition from acting as
     # an unconditional "close now" command.
@@ -456,18 +483,26 @@ env:
     reset_on_overtime: True
     stage_reward_scale: [1.0, 1.0, 1.0, 1.5]
 
+    # 2026-09-12: 19 -> 21 dims. Torso height and torso pitch joined the active
+    # HOMIE command set (see the homie_command_keys comment in
+    # config/obs/wbmanip/bin_push_homie.yaml for why and for the authoritative
+    # column-order derivation). Column order here must match that dict's
+    # iteration order filtered by homie_command_keys.
     delta_action_indices: [
       0, 1, 2,                                       # homie command (vx, vy, yaw)
-      3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,  # upper body
-      17, 18                                          # finger primitives
+      3,                                             # homie torso height
+      4,                                             # homie torso pitch
+      5, 6, 7, 8, 9, 10, 11,                         # left arm (7)
+      12, 13, 14, 15, 16, 17, 18,                    # right arm (7)
+      19, 20                                         # finger primitives (L, R)
     ]
     delta_action_scale: 0.3
     delta_action_clip: 15.0
     # Generic backmapping reads stale/pre-refresh state during staged reset.
     # Finger targets are synchronized explicitly by BinPushHomie instead.
     reset_delta_actions_with_backmap: False
-    left_finger_delta_action_index: 17
-    right_finger_delta_action_index: 18
+    left_finger_delta_action_index: 19
+    right_finger_delta_action_index: 20
 
     warped_action:
       indices: [0, 1, 2]

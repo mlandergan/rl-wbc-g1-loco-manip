@@ -159,7 +159,14 @@ rewards:
     # negative scale (half of grasp_fingertip_curl's magnitude) so it's a
     # real but not dominant discouragement -- not empirically validated.
     penalty_grasp_flat_press: -2.0
-    grasp_contact: 5.0
+    # 2026-09-12: 5.0 -> 3.0, alongside normalizing the term itself to [-1,1]
+    # (grasp_contact_force_norm in the env config). It was returning raw
+    # Newtons, so it earned 2.896 mean -- 2.1x the next term and 57x
+    # palm_down_alignment -- and the logs show the policy paying for that force
+    # with palm orientation (grasp_left_palm_down_s2 0.125 -> 0.064 while this
+    # climbed). Now that the units are bounded, 3.0 keeps contact as a strong
+    # but no longer dominant signal.
+    grasp_contact: 3.0
     # Run 25 (2026-08-13): companion to grasp_contact's new decomposed
     # horiz/vert fine gate (see _reward_grasp_contact docstring) — zeroing
     # that reward for a hovering-above hand removed ~0.65/step of GRASP
@@ -188,7 +195,17 @@ rewards:
     # 3-4x grasp_target_distance's ~0.45-0.6, while position/vert_progress
     # were actively regressing in the same window. Dialed back to give
     # position more room to compete.
-    palm_down_alignment: 2.0
+    # 2026-09-12: 2.0 -> 5.0. This is the term that encodes the actual failure
+    # the videos keep showing (palms not facing the bin, so fingers land flat on
+    # the lid instead of under the bar), and it was the weakest signal in the
+    # GRASP stack by earned magnitude: 0.051 mean, i.e. cos(palm, bin-down)
+    # ~0.026 -- palms essentially perpendicular to where they need to be, and
+    # getting worse over training. Deliberately raising the weight rather than
+    # re-adding a multiplicative alignment gate on grasp_contact: gating that
+    # reward on alignment is what caused the Run 23 / Run 25 wedge bugs (see
+    # _reward_grasp_contact's docstring), so the signal goes up on its own
+    # account instead.
+    palm_down_alignment: 5.0
     # Run 23 (2026-08-11): companion to grasp_contact's new twist gate (see
     # _reward_penalty_wrong_twist_contact docstring) — a live rollout showed
     # the palm wedged against the rim with twist 100-140deg off target for

@@ -53,13 +53,30 @@ algo:
     critic_learning_rate: 1.0e-4
     homie_walk_model_path: ./models/model_walk.pt
     homie_stand_model_path: ./models/model_stand.pt
-    homie_command_dim: 3  # vx, vy, yaw
+    homie_command_dim: 5  # vx, vy, yaw, torso height, torso pitch
     non_homie_command_actions_dim: 16  # 14 upper body dofs + 2 finger primitives
     opt_homie: False
     desired_kl: 0.005
 
-    init_noise_std: 0.8
-    max_noise_std: 0.8
+    # 2026-09-12: 0.8 -> 0.35 for both init and max. Policy/mean_noise_std sat
+    # flat at 0.69 for 14k iterations (it never meaningfully left the 0.8
+    # ceiling), and with delta_action_scale 0.3 that is a ~0.21 rad/step random
+    # walk on every one of the 14 arm-joint targets. The grasp gate asks for
+    # both palms held inside 4cm horizontal / 3cm vertical for
+    # grasp_transition_hold_steps=8 consecutive steps -- i.e. millimetre
+    # stability from a controller being kicked ~12deg per step. Consistent with
+    # grasp_both_position_ready_frac_s2 peaking at 0.073 and every
+    # *finger_close_ready* / *close_latched* / both_closed metric reading
+    # identically 0.0.
+    #
+    # The earlier entropy_coef 0.01 -> 0.003 change did not move the std,
+    # because the terminal-precision reward that would pay for shrinking it
+    # (bar_progress, vert_progress) was the 0.001-magnitude tail of the stack.
+    # Capping it directly is the more reliable lever. Watch early iterations for
+    # under-exploration -- if APPROACH/REACH stop progressing, raise max back
+    # toward 0.5 rather than reverting to 0.8.
+    init_noise_std: 0.35
+    max_noise_std: 0.35
     min_noise_std: 0.1
     clamp_noise_std: True
     save_interval: 50
@@ -149,6 +166,36 @@ robot:
     # pos_0 across this project's history will need to re-adapt to the new
     # value. Needs real training validation, not just the visual check this
     # was designed from.
+    # 2026-09-12 -- THUMB OPPOSITION WAS FROZEN. thumb_0 (the third entry, the
+    # thumb's base rotation joint) was 0.0 in BOTH pos_0 and pos_1, and
+    # FingerPrimitiveBase._apply_force_in_physics_step does
+    # lerp(pos_0, pos_1, action) -- so that joint's position target was exactly
+    # 0.0 for every action, every step, all four stages, for this project's
+    # entire history. The policy had no control over it at all.
+    #
+    # g1_43dof.yaml's own limit lists give thumb_0 a range of [-1.0472,
+    # +1.0472] (+-60deg) on BOTH hands, so the primitive was pinning it at dead
+    # centre and using none of the available travel. Without that joint the
+    # thumb cannot rotate across the palm into opposition against index/middle:
+    # the hand can curl its fingers within their own plane but cannot close a
+    # loop around a bar. That matches the repeated video finding of "no
+    # genuinely wrapped-around grasps" better than anything else in the task,
+    # and it also quietly inflated the closure diagnostics --
+    # _grasp_transition_components' `left_closed` check is
+    # |dof_pos - p1|.abs().mean() over all 7 joints, so a joint that cannot
+    # move contributed a permanent zero error on 1/7 of the sum.
+    #
+    # +-0.6 rad (~34deg) rather than the full 60deg: real opposition travel with
+    # margin left, so the PD target is not parked against a hard stop.
+    #
+    # SIGN IS NOT YET CONFIRMED. Every other thumb joint in pos_1 mirrors
+    # left-positive / right-negative (thumb_1 +0.785/-0.785, thumb_2
+    # +1.5708/-1.5708), so that convention is assumed here -- but thumb_0's
+    # rotation axis direction is only in the USD, which is an LFS pointer
+    # locally. If the sign is inverted the thumb rotates AWAY from the fingers,
+    # which is WORSE than the frozen 0.0. VERIFY VISUALLY on the VM
+    # (scripts/debug/render_finger_sweep_hand_only.py renders closure with the
+    # hand isolated) BEFORE spending iterations on it.
     primitive_action_map:
       left:
         pos_0: [
@@ -157,7 +204,7 @@ robot:
           0.0
         ]
         pos_1: [
-          -1.5708, -1.5708, 0.0,
+          -1.5708, -1.5708, 0.6,
           -1.5708, -1.5708, 0.785398,
           1.5708
         ]
@@ -168,7 +215,7 @@ robot:
           0.0
         ]
         pos_1: [
-          1.5708, 1.5708, 0.0,
+          1.5708, 1.5708, -0.6,
           1.5708, 1.5708, -0.785398,
           -1.5708
         ]
