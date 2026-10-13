@@ -349,6 +349,14 @@ class StagedTaskBase(LeggedRobotBase):
         is_overtime &= ~(is_last_stage & is_complete)
 
         if self.config.get("reset_on_overtime", True):
+            # 2026-09-29 overhand (I2): optionally treat stage overtime as a
+            # TIMEOUT (value bootstrap, no termination penalty) instead of a
+            # failure. Default False = old behaviour (overtime is a failure).
+            # Envs that already failed this step (fall, contact, ...) keep
+            # their failure label.
+            if self.config.get("overtime_is_timeout", False):
+                already_failed = self.reset_buf.bool() & ~self.time_out_buf.bool()
+                self.time_out_buf |= is_overtime & ~already_failed
             self.reset_buf |= is_overtime
         self.current_completed_task_buf |= is_complete
 

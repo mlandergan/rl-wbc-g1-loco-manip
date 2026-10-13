@@ -1,0 +1,343 @@
+# @package _global_
+
+# Standalone flattened config for bin_push_homie_overhand_approach_dr1
+# Inherits directly from /exp/wbmanip/bin_push_homie_lstm (all 16 overhand stage configs merged).
+
+defaults:
+- /exp/wbmanip/bin_push_homie_lstm
+- _self_
+exp_var: overhand_approach_dr1
+num_envs: 2048
+use_wandb: false
+algo:
+  trl:
+    num_total_batches: 10000
+    report_to: tensorboard
+    logging_dir: ${experiment_dir}/tensorboard
+callbacks:
+  model_save:
+    save_frequency: 100
+robot:
+  finger_primitive:
+    primitive_action_map:
+      left:
+        pos_0:
+        - -0.55
+        - -0.55
+        - 0.0
+        - -1.414
+        - -1.414
+        - 0.079
+        - 0.157
+        pos_1:
+        - -0.942
+        - -0.942
+        - 0.0
+        - -1.571
+        - -1.571
+        - 1.02
+        - 1.72
+      right:
+        pos_0:
+        - 0.55
+        - 0.55
+        - 0.0
+        - 1.414
+        - 1.414
+        - -0.079
+        - -0.157
+        pos_1:
+        - 0.942
+        - 0.942
+        - 0.0
+        - 1.571
+        - 1.571
+        - -1.02
+        - -1.72
+env:
+  config:
+    bin_asset_path: move_garbage/data/objects/bin/RecyclingContainerWithWheels_A01_Blue_01_dynamic_splithandle_wide.usd
+    enable_tilt_stage: true
+    max_stage_time:
+    - 200
+    - 100
+    - 150
+    - 125
+    - 900
+    stage_reward_scale:
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 5.0
+    staged_reset_ratios:
+    - 0.5
+    - 0.18
+    - 0.16
+    - 0.16
+    - 0.0
+    reset_bin_on_reset: true
+    grasp_init_path: move_garbage/data/grasp_init/overhand_th10_a080.npz
+    grasp_init_ratio: 0.05
+    grasp_init_arm_target: settled
+    grasp_init_joint_noise: 0.0
+    overtime_is_timeout: true
+    tilt_advance_min_deg: 10.0
+    tilt_advance_max_deg: 17.0
+    tilt_advance_hold_steps: 8
+    push_complete_min_tilt_deg: 5.0
+    push_complete_max_tilt_deg: 25.0
+    tilt_band_lo_deg: 5.0
+    tilt_band_lo_ramp_deg: 5.0
+    tilt_band_hi_deg: 22.0
+    tilt_band_hi_ramp_deg: 3.0
+    push_tilt_band_gate: true
+    bin_topple_terminate: true
+    bin_topple_min_deg: -8.0
+    bin_topple_max_deg: 30.0
+    push_grip_loose_check: true
+    push_grip_max_bar_dist: 0.08
+    push_grip_min_closure: 0.34
+    push_grasp_loss_grace_steps: 35
+    grasp_target_rot_left:
+    - 0.70442
+    - 0.06163
+    - -0.70442
+    - -0.06163
+    grasp_target_rot_right:
+    - 0.06163
+    - -0.70442
+    - 0.06163
+    - -0.70442
+    grasp_target_height_offset: 0.0521
+    grasp_target_standoff: 0.072
+    grasp_bar_valid_dist: 0.07
+    grasp_finger_close_bar_dist: 0.075
+    grasp_finger_close_horiz_dist: 0.075
+    grasp_finger_close_vert_dist: 0.075
+    grasp_finger_close_max_twist_rad: 1.3
+    grasp_palm_min_dz: 0.01
+    grasp_bar_reward_target: grasp_target
+    grasp_wrap_mode: overhand
+    grasp_gate_min_wrap: 0.5
+    grasp_finger_max_bar_dist: 0.018
+    grasp_ovh_prox_mode: segment_prox
+    grasp_ovh_finger_radius:
+    - 0.01
+    - 0.01
+    - 0.003
+    grasp_ovh_sigma: 0.01
+    grasp_ovh_prox_std: 0.02
+    grasp_ovh_edge_width: 0.003
+    grasp_ovh_slot_dy_min: -0.042
+    grasp_ovh_slot_dy_max: -0.008
+    grasp_ovh_thumb_dy_min: -0.01
+    grasp_wrap_worst_weight: 0.5
+    grasp_finger_near_gate_floor: 0.25
+    grasp_finger_worst_weight: 0.5
+    grasp_palm_align_from_target: false
+    grasp_wrap_thumb_over: false
+    grasp_wrap_use_tip: false
+    grasp_lid_exclude_thumb: false
+    grasp_flat_press_exclude_palm: true
+    grasp_lid_dy_max: -0.024
+    grasp_lid_dz_min: 0.0
+    grasp_lid_contact_force_max: 5.0
+    finger_preshape_frac: 0.0
+    finger_preshape_start_dist: 0.25
+    finger_preshape_full_dist: 0.05
+    bin_tilt_target_deg: 13.5
+    bin_tilt_back_std_deg: 6.0
+    bin_tilt_progress_norm: 0.05
+    push_cmd_deadband: 0.5
+    push_cmd_target: 0.7
+    push_cmd_tilt_floor: 0.0
+    push_force_nomoment_max: 60.0
+    push_force_line_angle_deg: 60.0
+    stop_reward_mode: additive
+    stage_advance_require_resting_arms: true
+    grasp_target_anisotropic_horiz_std: 0.08
+    grasp_target_anisotropic_vert_std: 0.06
+    grasp_wrap_rho0: 0.04
+    grasp_wrap_rho_std: 0.02
+    spawn_x_range:
+    - -0.95
+    - -0.87
+    spawn_y_range:
+    - -0.06
+    - 0.06
+    spawn_yaw_range_deg: 5.0
+    reset_wrist_random_scale: 0.0
+    reset_finger_random_scale: 0.0
+    grasp_is_final: false
+    tilt_is_final: false
+    reset_on_complete: true
+    reset_on_complete_delay: 0
+    grasp_gate_min_closure: 0.35
+    bin_tilt_moment_ref_Nm: 30.0
+    bin_tilt_moment_point: bar
+    bin_tilt_moment_off_deg: 12.0
+    bin_tilt_moment_off_ramp_deg: 4.0
+    body_bin_contact_deadband_N: 10.0
+    body_bin_contact_scale_N: 100.0
+    body_bin_contact_max: 3.0
+    body_bin_contact_tilt_scale: 1.0
+    body_bin_contact_push_scale: 1.0
+    bin_mass_curriculum: true
+    bin_mass_start_kg: 3.0
+    bin_mass_end_kg: 13.0
+    bin_mass_step_kg: 1.0
+    bin_mass_spread_kg: 7.0
+    bin_mass_advance_min_episodes: 1500
+    bin_mass_advance_success: 0.35
+    bin_tilt_moment_friction: true
+    bin_tilt_moment_friction_sign: 1.0
+    task:
+      target_obj_contact_track_friction: true
+      target_obj_contact_max_data_per_prim: 64
+    bin_tilt_moment_min_ratio: -1.0
+    bin_mass_level_reset_kg: 13.0
+    termination_curriculum:
+      min_level: 1.0
+    push_stage_logs: true
+    success_by_mass_edges_kg:
+    - 6.0
+    - 9.0
+    - 11.0
+    - 13.0
+    push_progress_use_bar_min: true
+    bin_tilt_progress_clip_deg: 13.5
+    bin_tilt_steady_std_dps: 35.0
+    tilt_walk_ramp_in_band: true
+    tilt_walk_ramp_scale: 0.5
+    tilt_walk_ramp_rate_std_dps: 25.0
+    push_distance_curriculum: true
+    push_distance_start_m: 0.15
+    push_distance_end_m: 3.5
+    push_distance_step_m: 0.05
+    push_distance_advance_success: 0.35
+    push_distance_advance_min_episodes: 1500
+    tilt_advance_max_rate_dps: 12.0
+    tilt_rate_curriculum_start_dps: 30.0
+    tilt_rate_curriculum_factor: 0.9
+    tilt_rate_curriculum_success: 0.5
+    tilt_rate_curriculum_loosen_success: 0.2
+    tilt_rate_curriculum_min_episodes: 2000
+    tilt_overtime_is_timeout: false
+    grasp_shape_in_tilt_push_scale: 1.0
+    bin_tilt_back_zero_at_upright: true
+    bin_tilt_moment_stall_decay_steps: 30
+    bin_tilt_moment_stall_span_steps: 25
+    bin_tilt_moment_stall_min_deg: 10.0
+    reanchor_bar_on_push_settle: true
+    push_settle_reanchor_steps: 15
+    push_stage_grip_max_bar_dist: 0.1
+    push_stage_grip_min_closure: 0.34
+    push_cmd_pre_deadband_weight: 0.35
+    bin_tilt_back_min_deg_tilt: 4.0
+    bin_tilt_moment_brake_in_push: true
+    bin_tilt_moment_brake_start_deg: 11.0
+    bin_tilt_moment_steady_hold_Nm: 7.0
+    episode_length_s: 28.0
+    push_distance_step_schedule:
+    - - 0.25
+      - 0.05
+    - - 1.0
+      - 0.15
+    - - 5.0
+      - 0.25
+    push_anti_stall_enable: true
+    push_stall_grace_steps: 25
+    push_stall_ramp_steps: 15
+    push_stall_min_vel: 0.02
+    push_stall_full_vel: 0.12
+    push_stall_hold_floor: 0.15
+    push_progress_require_positive_vel: true
+    push_progress_vel_gate_mps: 0.05
+    push_cmd_target_vx: 0.7
+    push_cmd_sub_deadband_penalty: 0.5
+    step_forward_zero_at_rest: true
+    step_forward_stall_penalty: 1.0
+    step_forward_min_vel: 0.05
+    step_forward_target_vel: 0.25
+    step_forward_vel_std: 0.15
+    penalize_lateral_yaw_cmd_in_push: true
+    pre_push_overtime_is_timeout: false
+    arm_branch_overhand_mode: true
+    arm_branch_left_syaw_min: -1.15
+    arm_branch_left_syaw_max: 0.1
+    arm_branch_right_syaw_min: -0.8
+    arm_branch_right_syaw_max: 0.35
+    arm_branch_left_wroll_min: 0.25
+    arm_branch_left_wroll_max: 1.65
+    arm_branch_right_wroll_min: -1.65
+    arm_branch_right_wroll_max: -0.25
+    arm_branch_wpitch_limit: 0.95
+    arm_branch_wyaw_limit: 0.85
+    spawn_polar_dr: true
+    spawn_polar_curriculum: true
+    spawn_bin_yaw_range_deg: 180.0
+    spawn_polar_dist_min_m: 0.02
+    spawn_polar_dist_start_m: 0.35
+    spawn_polar_dist_level_reset_m: 0.35
+    spawn_polar_dist_max_m: 1.1
+    spawn_polar_dist_step_m: 0.15
+    spawn_polar_phi_start_deg: 15.0
+    spawn_polar_phi_max_deg: 45.0
+    spawn_polar_fov_yaw_start_deg: 10.0
+    spawn_polar_fov_yaw_max_deg: 20.0
+    spawn_polar_curriculum_min_episodes: 800
+    spawn_polar_curriculum_advance_reach: 0.75
+    spawn_polar_curriculum_advance_success: 0.5
+    stop_transition_yaw_tolerance_deg: 12.0
+    stage_advance_ang_vel: 0.4
+    stage_advance_arm_tolerance: 0.35
+    reset_delta_actions_to_resting: true
+    approach_arm_delta_decay: 0.5
+    approach_arm_action_l1_weight: 0.0
+    arm_branch_skip_in_approach: true
+    approach_transition_hold_steps: 5
+    approach_reset_stage_timer_on_advance: true
+    walk_taper_near: 0.06
+    walk_taper_far: 0.22
+    walk_to_bin_zero_at_rest: true
+    stop_at_bin_include_yaw: true
+    stop_pos_coarse_std: 0.6
+    stop_yaw_std_deg: 15.0
+    push_distance_level_reset_m: 1.5
+    approach_is_final: false
+rewards:
+  reward_penalty_curriculum: false
+  reward_penalty_reward_names: []
+  reward_scales:
+    torso_lean: 0.0
+    left_arm_posture: 0.0
+    penalty_left_wrist_roll: 0.0
+    penalty_arm_branch_guard: -4.0
+    penalty_left_arm_posture_l1: 0.0
+    grasp_target_anisotropic: 6.0
+    grasp_finger_wrap: 8.0
+    penalty_lid_contact: -1.5
+    penalty_palm_below_bar: -2.0
+    bin_tilt_back: 20.0
+    bin_tilt_progress: 4.0
+    push_bin_progress: 35.0
+    push_forward_command: 6.0
+    step_forward_while_pushing: 14.0
+    push_bin_force: 0.0
+    push_force_nomoment: 0.1
+    maintain_grasp_while_pushing: 3.0
+    penalty_bin_tilt: 0.0
+    complete: 1000.0
+    bin_tilt_moment: 10.0
+    penalty_body_bin_contact: -0.5
+    bin_tilt_steady: 12.0
+    tilt_advance: 2500.0
+    reach_left: 6.0
+    reach_right: 6.0
+    grasp_advance: 1500.0
+    walk_to_bin: 8.0
+    stop_at_bin: 10.0
+    approach_walk_command: 6.0
+    approach_advance: 1000.0
+    penalty_upper_body_non_finger_deviation_l1: -1.0

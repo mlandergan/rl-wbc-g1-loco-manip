@@ -862,9 +862,25 @@ class IsaacSim(BaseSimulator):
                 object_contact_prim_path = os.path.join(
                     object_contact_prim_path, self.task_config.target_obj_contact_sub_prim_path
                 )
+            # 2026-10-01: optional friction tracking. force_matrix_w is the
+            # NORMAL contact force only (Isaac Lab ContactSensorData), so a
+            # claw grip whose load goes through friction is invisible / mis-
+            # signed in it. task.target_obj_contact_track_friction=True adds
+            # data.friction_forces_w (same (N, B, filters, 3) layout), exposed
+            # as object_to_hand_friction_forces in refresh_sim_tensors. The
+            # contact buffer is max_contact_data_count_per_prim * num_envs
+            # points in total; a two-hand claw grip has tens of points per env,
+            # so raise target_obj_contact_max_data_per_prim with it. Defaults
+            # (False / 4) = the old sensor.
             object_to_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
                 prim_path=object_contact_prim_path,
                 filter_prim_paths_expr=g1_hand_links,
+                track_friction_forces=bool(
+                    self.task_config.get("target_obj_contact_track_friction", False)
+                ),
+                max_contact_data_count_per_prim=int(
+                    self.task_config.get("target_obj_contact_max_data_per_prim", 4)
+                ),
             )
             object_to_hand_frame_transformer_config: FrameTransformerCfg = FrameTransformerCfg(
                 prim_path=object_contact_prim_path,
@@ -1891,6 +1907,11 @@ class IsaacSim(BaseSimulator):
                 self.object_to_hand_contact_forces = (
                     self.object_to_hand_contact_sensor.data.force_matrix_w.clone()
                 )
+                # 2026-10-01: friction part of the same contacts (only when
+                # task.target_obj_contact_track_friction is on; else None).
+                _fr = getattr(self.object_to_hand_contact_sensor.data, "friction_forces_w", None)
+                if _fr is not None:
+                    self.object_to_hand_friction_forces = _fr.clone()
             elif hasattr(self.task_config, "hold_object_contact_sensor"):
                 self.hold_object_to_hand_contact_forces = (
                     self.hold_object_to_hand_contact_sensor.data.force_matrix_w.clone()

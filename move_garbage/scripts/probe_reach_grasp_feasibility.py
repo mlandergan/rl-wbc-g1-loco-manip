@@ -321,6 +321,21 @@ def main(override_config: OmegaConf):
     final_hold_steps = int(config.get("probe_final_hold_steps", 20))
     traj_path = config.get("probe_out", "/tmp/probe_traj.npz")
     ik_damping = float(config.get("probe_ik_damping", 0.05))
+    # 2026-09-24: finger pre-shape sanity -- hard-code the finger primitive to
+    # a fixed open->closed fraction for the whole probe (None = untouched).
+    probe_finger_frac = config.get("probe_finger_frac", None)
+    probe_descend_to_bar = bool(config.get("probe_descend_to_bar", False))
+    probe_descend_waypoints = int(config.get("probe_descend_waypoints", 5))
+
+    def _apply_probe_fingers():
+        if probe_finger_frac is None:
+            return
+        frac = float(probe_finger_frac)
+        target = env_u._finger_open_action + frac * (
+            env_u._finger_closed_action - env_u._finger_open_action
+        )
+        env_u._delta_actions[:, env_u._left_finger_delta_idx] = target
+        env_u._delta_actions[:, env_u._right_finger_delta_idx] = target
 
     action_scale = float(env_u.config.robot.control.action_scale)
     delta_action_clip = float(env_u.config.get("delta_action_clip", 15.0))
@@ -533,6 +548,7 @@ def main(override_config: OmegaConf):
         one-time teleport above, and never calls a lower-level physics-step
         API bypassing env_u.step()."""
         nonlocal obs_dict
+        _apply_probe_fingers()
         action19 = torch.zeros(num_envs, 19, device=device)  # cols 3:17 ignored: the
         # arm targets are already injected into env_u._delta_actions above and
         # DeltaActionBase does `_delta_actions += action*delta_action_scale`,
@@ -713,6 +729,49 @@ def main(override_config: OmegaConf):
                     f"left_ee_pos={robot.data.body_pos_w[0, left_palm_body, :].tolist()} "
                     f"left_target_pos={left_pos[0].tolist()} err_left={float(err_left[0]):.4f}"
                 )
+
+    # ---- 2026-09-24: optional descent from hover target onto the raw bar ----
+    if probe_descend_to_bar:
+        def _descent(hover_fn, bar_fn, rot_fn, axis_np):
+            hover = hover_fn()[0].detach().cpu().numpy()
+            bar = bar_fn()[0].detach().cpu().numpy()
+            quat = rot_fn()[0].detach().cpu().numpy()
+            off = float(env_u.config.get("palm_grasp_point_offset", 0.0464))
+            out = []
+            for i in range(1, probe_descend_waypoints + 1):
+                gp = hover + (bar - hover) * (i / probe_descend_waypoints)
+                out.append(_grasp_point_to_palm_pose(gp, quat, axis_np, off))
+            return out
+
+        left_desc = _descent(env_u._left_handle_target, env_u._left_bar_raw_pos,
+                             lambda: _wrap_wxyz(env_u._left_handle_target_rot()),
+                             left_axis_np)
+        right_desc = _descent(env_u._right_handle_target, env_u._right_bar_raw_pos,
+                              lambda: _wrap_wxyz(env_u._right_handle_target_rot()),
+                              right_axis_np)
+        for d_i in range(probe_descend_waypoints):
+            last = d_i == probe_descend_waypoints - 1
+            keyframe = "at_bar" if last else f"descend_{d_i}"
+            hold = final_hold_steps if last else steps_per_waypoint
+            lp = torch.as_tensor(left_desc[d_i][0], device=device, dtype=torch.float32).repeat(num_envs, 1)
+            lq = torch.as_tensor(left_desc[d_i][1], device=device, dtype=torch.float32).repeat(num_envs, 1)
+            rp = torch.as_tensor(right_desc[d_i][0], device=device, dtype=torch.float32).repeat(num_envs, 1)
+            rq = torch.as_tensor(right_desc[d_i][1], device=device, dtype=torch.float32).repeat(num_envs, 1)
+            for _hold_i in range(hold):
+                q_left, err_left = ik_step(ik_left, left_jacobi_idx, left_dof_idx, lp, lq)
+                q_right, err_right = ik_step(ik_right, right_jacobi_idx, right_dof_idx, rp, rq)
+                hit_limit = apply_arm_targets(q_left, q_right)
+                real_env_step()
+                log_step(keyframe, hit_limit, err_left, err_right)
+        print("\n==================== DESCENT TO BAR ====================")
+        print(f"  probe_finger_frac={probe_finger_frac}")
+        for label in [f"descend_{i}" for i in range(probe_descend_waypoints - 1)] + ["at_bar"]:
+            idxs = [i for i, k in enumerate(log["keyframe"]) if k == label]
+            j = idxs[-1]
+            print(f"  {label:10s} hand_bar_dist L={log['hand_bar_dist'][j][0]:.4f} "
+                  f"R={log['hand_bar_dist'][j][1]:.4f}  ik_err L={log['ik_pos_err_left'][j]:.4f} "
+                  f"R={log['ik_pos_err_right'][j]:.4f}  limit L={log['ik_hit_limit_left'][j]} "
+                  f"R={log['ik_hit_limit_right'][j]}")
 
     # ---- save trajectory + diagnostics ----
     np.savez_compressed(

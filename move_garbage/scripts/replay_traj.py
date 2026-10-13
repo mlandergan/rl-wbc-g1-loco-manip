@@ -640,7 +640,7 @@ def main() -> None:
 
     writer.close()
     print(f"[replay] wrote {args.out} ({frames} frames, {os.path.getsize(args.out)/1e6:.2f} MB)")
-    if args.force_exit_after_write:
+    if True:
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

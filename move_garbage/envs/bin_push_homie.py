@@ -41,6 +41,7 @@ from isaaclab.utils.math import (
     quat_error_magnitude,
     quat_from_euler_xyz,
     quat_inv,
+    quat_mul,
     subtract_frame_transforms,
 )
 from typing_extensions import override
@@ -63,6 +64,34 @@ _FALLBACK_BIN_METADATA = {
     "pushAxisWorld": (1.0, 0.0, 0.0),
 }
 
+# 2026-09-29 overhand: bar capsule radius (handle_collider) -- used by the
+# overhand wrap score (surface distance = distance to bar axis - R).
+_BAR_RADIUS = 0.0165
+
+
+def _effective_in_named_stages(*names):
+    """2026-09-29 overhand: like ``StagedTaskBase.effective_in_stage`` but the
+    stages are given by NAME ("GRASP", "TILT", "PUSH", ...) and resolved on
+    the instance (``self.STAGE_<NAME>``) at call time. Needed because the
+    stage indices now depend on config: with ``enable_tilt_stage`` TILT=3 and
+    PUSH=4, without it TILT=-1 (never matches) and PUSH=3 (old 4-stage
+    layout, so old experiments keep working unchanged)."""
+
+    def decorator(func):
+        def wrapper(self, *args, **kwargs):
+            reward = func(self, *args, **kwargs)
+            assert isinstance(reward, torch.Tensor)
+            assert reward.shape == (self.num_envs,)
+            return torch.where(
+                self._named_stage_mask(names), reward, torch.zeros_like(reward)
+            )
+
+        wrapper.__name__ = func.__name__
+        wrapper.__doc__ = func.__doc__
+        return wrapper
+
+    return decorator
+
 
 class BinPushHomie(
     StagedTaskBase,
@@ -71,18 +100,50 @@ class BinPushHomie(
     HomieBase,
     FingerPrimitiveBase,
 ):
-    """Bimanual bin-push task with a 4-stage curriculum."""
+    """Bimanual bin-push task with a 4-stage curriculum (5 with enable_tilt_stage)."""
 
     STAGE_APPROACH = 0
     STAGE_REACH = 1
     STAGE_GRASP = 2
     STAGE_PUSH = 3
+    # 2026-09-29 overhand: optional TILT stage between GRASP and PUSH. These
+    # class values are the OLD 4-stage layout (TILT disabled = -1); __init__
+    # overrides them per instance when env.config.enable_tilt_stage is True
+    # (TILT=3, PUSH=4). Rewards that involve TILT/PUSH therefore use
+    # _effective_in_named_stages (resolved at call time), never the class
+    # constants.
+    STAGE_TILT = -1
 
     # ================================================================
     # SETUP
     # ================================================================
 
     def __init__(self, config, device):
+        # 2026-09-29 overhand: stage layout must be known BEFORE the base
+        # constructors run (they compute observations / logs on reset).
+        self._tilt_enabled = bool(config.get("enable_tilt_stage", False))
+        expected_stages = 5 if self._tilt_enabled else 4
+        assert len(config.max_stage_time) == expected_stages, (
+            f"enable_tilt_stage={self._tilt_enabled} needs max_stage_time with "
+            f"{expected_stages} entries, got {len(config.max_stage_time)}"
+        )
+        if self._tilt_enabled:
+            self.STAGE_TILT = 3
+            self.STAGE_PUSH = 4
+        # 2026-09-29 overhand: bin asset selectable from config
+        # (env.config.bin_asset_path, relative to the repo root). The scenario
+        # module (move_garbage/scenario_cfg/isaacsim.py) reads BIN_ASSET_PATH
+        # when the simulator builds the scene inside super().__init__, so it
+        # is exported here. An explicitly set BIN_ASSET_PATH env var still
+        # wins (old launchers unchanged).
+        bin_asset_path = config.get("bin_asset_path", None)
+        if bin_asset_path and not os.environ.get("BIN_ASSET_PATH"):
+            from gr00t.rl.utils.paths import resolve_repo_path
+
+            resolved = str(resolve_repo_path(str(bin_asset_path)))
+            assert os.path.isfile(resolved), f"bin_asset_path not found: {resolved}"
+            os.environ["BIN_ASSET_PATH"] = resolved
+            logger.info(f"bin_asset_path -> BIN_ASSET_PATH={resolved}")
         super().__init__(config, device)
 
         # finger primitive related — mirror drawer_pull_homie
@@ -220,6 +281,9 @@ class BinPushHomie(
 
         # Cache the initial bin XY (world frame, per-env) for push-progress obs.
         self._initial_bin_pos_xy = torch.zeros(self.num_envs, 2, device=self.device)
+        # 2026-10-03 push2: handle-bar midpoint XY at the PUSH handover (for
+        # push_progress_use_bar_min, so backward tipping cannot fake +x progress).
+        self._initial_bar_pos_xy = torch.zeros(self.num_envs, 2, device=self.device)
         self._register_buffer_to_track(
             "initial_bin_pos_xy",
             (self.num_envs, 2),
@@ -315,6 +379,9 @@ class BinPushHomie(
         self._reach_transition_ready_steps = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )
+        self._approach_transition_ready_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self._left_finger_close_latched = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -357,6 +424,182 @@ class BinPushHomie(
         self._prev_right_bar_dist = torch.full(
             (self.num_envs,), 1.0, device=self.device
         )
+        # 2026-09-29 overhand: consecutive TILT steps with the bin inside the
+        # tilt band while the grip is maintained (TILT->PUSH gate), and the
+        # previous-step tilt potential for _reward_bin_tilt_progress (same
+        # first-step masking pattern as _prev_left_twist above).
+        self._tilt_hold_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._prev_tilt_potential = torch.zeros(self.num_envs, device=self.device)
+        # 2026-09-30 overhand grasp_init: True for envs whose current episode
+        # started from the canned grasped state (directly in TILT). Cleared on
+        # every reset in _reset_tasks_callback, set in
+        # _reset_robot_states_callback (stage-0 resets only).
+        self._grasp_init_mask = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        # 2026-10-01 success metrics (logging only, see _record_episode_outcomes):
+        # stage each episode started in (set_to_stage) and a ring buffer of
+        # the last `success_metrics_window` ended episodes.
+        self._ep_start_stage = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        w = int(self.config.get("success_metrics_window", 512))
+        self._succ_win = w
+        self._succ_ptr = 0
+        self._succ_count = 0
+        # columns: completed, entered_grasp, grasp_reached_tilt, entered_tilt,
+        # time_at_completion_s, started_at_or_before_grasp
+        # 2026-10-03 push1: + reached_push, bin_body_mass_kg (logging only;
+        # the buffer is not part of the env state dict, so old checkpoints load).
+        # 2026-10-06 full3: + started_approach, reached_reach (columns 8, 9).
+        self._succ_buf = torch.zeros(w, 10, device=self.device)
+        # 2026-10-01 tilt3: bin body-mass curriculum (bin_mass_curriculum,
+        # default False = the USD's fixed 15 kg body). See
+        # _apply_bin_mass_curriculum / _update_bin_mass_curriculum. The level
+        # is also written to log_dict["bin_mass_level_kg"]; legged_robot_base
+        # saves log_dict as the env state dict and load_env_state_dict restores
+        # attributes of the same name, so a resume keeps the level.
+        self._bin_mass_cur = bool(self.config.get("bin_mass_curriculum", False))
+        self.bin_mass_level_kg = torch.tensor(
+            float(self.config.get("bin_mass_start_kg", 15.0)), device=self.device
+        )
+        self._bin_mass_ep_level = torch.full((self.num_envs,), -1.0, device=self.device)
+        self._bin_mass_env = torch.full((self.num_envs,), 15.0, device=self.device)
+        self._bin_mass_lvl_eps = 0
+        self._bin_mass_lvl_succ = 0
+        # 2026-10-03 tilt7: steady-hold TILT->PUSH gate (tilt_advance_max_rate_dps,
+        # default None = no rate condition = old behaviour). The hold counter and
+        # the gate step also require |d tilt/dt| (_bin_tilt_rate_dps) <= the
+        # episode's threshold _tilt_rate_thr_env, copied from
+        # tilt_gate_max_rate_dps at every reset. With tilt_rate_curriculum_start_dps
+        # the threshold starts there and _update_tilt_rate_curriculum tightens it
+        # down to tilt_advance_max_rate_dps; without it, it is fixed at
+        # tilt_advance_max_rate_dps. tilt_gate_max_rate_dps is also written to
+        # log_dict (= the env state dict), so a resume restores it (same
+        # mechanism as bin_mass_level_kg; re-clamped in load_env_state_dict).
+        rate_floor = self.config.get("tilt_advance_max_rate_dps", None)
+        rate_start = self.config.get("tilt_rate_curriculum_start_dps", None)
+        self._tilt_rate_gate = rate_floor is not None
+        self._tilt_rate_cur = self._tilt_rate_gate and rate_start is not None
+        if self._tilt_rate_cur:
+            thr0 = max(float(rate_start), float(rate_floor))
+        elif self._tilt_rate_gate:
+            thr0 = float(rate_floor)
+        else:
+            thr0 = float("inf")
+        self.tilt_gate_max_rate_dps = torch.tensor(thr0, device=self.device)
+        self._tilt_rate_thr_env = torch.full((self.num_envs,), thr0, device=self.device)
+        self._tilt_rate_lvl_eps = 0
+        self._tilt_rate_lvl_succ = 0
+        # 2026-10-03 tilt7 (logging only): ring buffer of the last
+        # tilt_gate_log_window (1024) TILT->PUSH handovers: tilt rate (deg/s,
+        # signed) and tilt (deg) at the handover step. Not in the env state dict.
+        gw = int(self.config.get("tilt_gate_log_window", 1024))
+        self._gate_win = gw
+        self._gate_ptr = 0
+        self._gate_count = 0
+        self._gate_buf = torch.zeros(gw, 2, device=self.device)
+        # 2026-10-03 push2: PUSH target distance curriculum
+        # (push_distance_curriculum, default False = fixed target_bin_push_distance).
+        # Saved in log_dict["target_bin_push_distance_m"] (= env state dict) so
+        # resumes keep the current level; privileged_bin_info obs keeps reading
+        # self.target_bin_push_distance (1.0) so actor obs never shifts.
+        self._push_dist_cur = bool(self.config.get("push_distance_curriculum", False))
+        pdist0 = (
+            float(self.config.get("push_distance_start_m", 0.10))
+            if self._push_dist_cur
+            else float(self.config.get("target_bin_push_distance", 1.0))
+        )
+        self.target_bin_push_distance_m = torch.tensor(pdist0, device=self.device)
+        self._push_dist_ep_level = torch.full((self.num_envs,), pdist0, device=self.device)
+        self._push_dist_lvl_eps = 0
+        self._push_dist_lvl_succ = 0
+        # 2026-10-06 full3: polar STAGE_APPROACH spawn DR & curriculum
+        # (spawn_polar_dr, default False = rectangular spawn_x_range / spawn_y_range).
+        # Saved in log_dict["spawn_dr_dist_level_m"] (= env state dict) so resumes
+        # keep the current level.
+        self._spawn_polar_dr = bool(self.config.get("spawn_polar_dr", False))
+        self._spawn_polar_cur = (
+            bool(self.config.get("spawn_polar_curriculum", False)) and self._spawn_polar_dr
+        )
+        sdist0 = (
+            float(self.config.get("spawn_polar_dist_start_m", 0.30))
+            if self._spawn_polar_cur
+            else float(self.config.get("spawn_polar_dist_max_m", 1.10))
+        )
+        self.spawn_dr_dist_level_m = torch.tensor(sdist0, device=self.device)
+        self._spawn_dr_ep_level = torch.full((self.num_envs,), sdist0, device=self.device)
+        self._spawn_dr_lvl_eps = 0
+        self._spawn_dr_lvl_reach = 0
+        self._spawn_dr_lvl_succ = 0
+        self._spawn_dr_init_dist = torch.zeros(self.num_envs, device=self.device)
+        self._spawn_dr_init_phi_deg = torch.zeros(self.num_envs, device=self.device)
+        self._spawn_dr_init_yaw_deg = torch.zeros(self.num_envs, device=self.device)
+        self._spawn_bin_yaw_rad = torch.zeros(self.num_envs, device=self.device)
+
+    # 2026-09-29 overhand: stage-mask helpers (see _effective_in_named_stages).
+    def _named_stage_mask(self, names):
+        mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        for name in names:
+            stage = getattr(self, f"STAGE_{name}")
+            if stage >= 0:
+                mask |= self.stage_buf == stage
+        return mask
+
+    def _holding_stage_mask(self, stage_buf=None):
+        """True in the stages where the bar must stay grasped (TILT, PUSH).
+        == STAGE_PUSH only when the TILT stage is disabled (STAGE_TILT=-1)."""
+        stage_buf = self.stage_buf if stage_buf is None else stage_buf
+        return (stage_buf == self.STAGE_PUSH) | (stage_buf == self.STAGE_TILT)
+
+    def _push_motion_anti_stall_weight(self):
+        """2026-10-04 push6 (push_anti_stall_enable, default False): in
+        STAGE_PUSH, after a brief settle grace window (push_stall_grace_steps,
+        default 25 = 0.50 s), ramp in (over push_stall_ramp_steps, default 15 =
+        0.30 s) a forward-velocity gate based on min(pelvis_fwd_vel,
+        bin_root_fwd_vel, bar_fwd_vel). Standing still or pushing only with the
+        arms (pelvis_fwd_vel <= push_stall_min_vel) scales static holding
+        rewards down to push_stall_hold_floor (0.15); walking forward with the
+        bin at >= push_stall_full_vel (0.12 m/s) earns 1.0."""
+        if not bool(self.config.get("push_anti_stall_enable", False)):
+            return torch.ones(self.num_envs, device=self.device)
+        root_vel = self.simulator.robot_root_states[:, 7:10].clone()
+        root_vel[:, 2] = 0.0
+        axis_unit = F.normalize(self.push_axis_world, dim=-1)
+        pelvis_fwd = (root_vel * axis_unit).sum(dim=-1)
+        bin_vel = self.simulator.get_task_root_state("bin")[:, 7:10]
+        bin_fwd = torch.minimum((bin_vel * axis_unit).sum(dim=-1), self._bar_fwd_vel())
+        v_eff = torch.minimum(pelvis_fwd, bin_fwd)
+        v_min = float(self.config.get("push_stall_min_vel", 0.02))
+        v_full = max(float(self.config.get("push_stall_full_vel", 0.12)), v_min + 1e-3)
+        floor = float(self.config.get("push_stall_hold_floor", 0.15))
+        w_vel = floor + (1.0 - floor) * ((v_eff - v_min) / (v_full - v_min)).clamp(0.0, 1.0)
+        grace = float(self.config.get("push_stall_grace_steps", 25.0))
+        ramp = max(float(self.config.get("push_stall_ramp_steps", 15.0)), 1e-3)
+        alpha = ((self.time_in_stage_buf.float() - grace) / ramp).clamp(0.0, 1.0)
+        w_push = 1.0 - alpha * (1.0 - w_vel)
+        return torch.where(
+            self.stage_buf == self.STAGE_PUSH, w_push, torch.ones_like(w_push)
+        )
+
+    def _grasp_shape_stage_scale(self):
+        """2026-10-03 push4: optional multiplier (grasp_shape_in_tilt_push_scale,
+        default 1.0 = unchanged) applied to the static grasp-acquisition shaping
+        terms once the episode is in TILT or PUSH. Scaling them down (e.g. 0.15)
+        in TILT/PUSH removes the +0.74/step static survival-farming baseline in
+        TILT and frees wrist compliance during tilting/pushing, while
+        maintain_grasp_while_pushing continues to reward keeping both hands on
+        the bar."""
+        scale = float(self.config.get("grasp_shape_in_tilt_push_scale", 1.0))
+        if scale == 1.0:
+            return 1.0
+        return torch.where(
+            self._holding_stage_mask(),
+            torch.full((self.num_envs,), scale, device=self.device),
+            torch.ones(self.num_envs, device=self.device),
+        )
 
     # ================================================================
     # OBSERVATIONS
@@ -392,8 +635,20 @@ class BinPushHomie(
         # Without this call the latches would freeze at their reset value
         # (False) forever, since this was their only remaining updater.
         self._finger_control_masks()
-        for stage in range(4):
+        # 2026-09-29 overhand: num_stages (5 with enable_tilt_stage).
+        for stage in range(self.num_stages):
             self.log_dict[f"stage_{stage}_frac"] = (self.stage_buf == stage).float().mean()
+        # 2026-09-30 overhand grasp_init: fraction of envs currently running an
+        # episode that started from the canned grasped state.
+        self.log_dict["grasp_init_frac"] = self._grasp_init_mask.float().mean()
+        for dbg_step in self.config.get("grasp_init_debug_steps", None) or []:
+            dbg_ids = torch.where(
+                self._grasp_init_mask & (self.episode_length_buf == int(dbg_step))
+            )[0]
+            if len(dbg_ids) > 0:
+                self._grasp_init_debug_report(int(dbg_step), dbg_ids)
+        if self.config.get("grasp_init_debug_csv", None):
+            self._grasp_init_debug_csv_row()
 
         left_palm, right_palm = self._palm_grasp_points()
         ref_left, ref_right = self._grasp_reference_targets()
@@ -421,10 +676,13 @@ class BinPushHomie(
             - self.resting_dof_pos[:, self._upper_non_finger_dof_idx]
         ).max(dim=-1).values
         approach_stance_ready = self._standoff_ready_mask()
+        approach_yaw_ready = self._approach_yaw_ready_mask()
+        approach_yaw_err_deg = torch.rad2deg(self._approach_yaw_error_rad().abs())
         approach_speed_ready = root_speed < float(
             self.config.get("stage_advance_vel", 0.2)
         )
-        approach_arms_ready = upper_deviation < 0.3
+        arm_tol = float(self.config.get("stage_advance_arm_tolerance", 0.3))
+        approach_arms_ready = upper_deviation < arm_tol
         approach_min_standoff = float(
             self.config.get("approach_min_standoff", 0.40)
         )
@@ -437,6 +695,15 @@ class BinPushHomie(
         self.log_dict["approach_lateral_error_s0"] = lateral_error[
             approach_mask
         ].mean()
+        self.log_dict["approach_yaw_error_deg_s0"] = approach_yaw_err_deg[
+            approach_mask
+        ].mean()
+        self.log_dict["approach_yaw_ready_frac_s0"] = approach_yaw_ready[
+            approach_mask
+        ].float().mean()
+        self.log_dict["approach_homie_cmd_norm_s0"] = (
+            self.get_physical_homie_commands()[approach_mask, :3].norm(dim=-1).mean()
+        )
         self.log_dict["approach_too_close_frac_s0"] = (
             signed_standoff < approach_min_standoff
         )[approach_mask].float().mean()
@@ -449,9 +716,30 @@ class BinPushHomie(
         self.log_dict["approach_arms_ready_frac_s0"] = approach_arms_ready[
             approach_mask
         ].float().mean()
+        self.log_dict["approach_max_arm_dev_s0"] = upper_deviation[
+            approach_mask
+        ].mean()
         self.log_dict["approach_transition_ready_frac_s0"] = (
-            approach_stance_ready & approach_speed_ready & approach_arms_ready
+            approach_stance_ready
+            & approach_yaw_ready
+            & approach_speed_ready
+            & approach_arms_ready
         )[approach_mask].float().mean()
+        if getattr(self, "_spawn_polar_dr", False):
+            _, d_lvl, phi_lvl, dpsi_lvl = self._spawn_polar_active_bounds()
+            self.log_dict["spawn_dr_dist_level_m"] = self.spawn_dr_dist_level_m.clone()
+            self.log_dict["spawn_dr_phi_level_deg"] = torch.tensor(
+                phi_lvl, device=self.device
+            )
+            self.log_dict["spawn_dr_fov_yaw_level_deg"] = torch.tensor(
+                dpsi_lvl, device=self.device
+            )
+            self.log_dict["spawn_dr_init_dist_mean_m"] = self._spawn_dr_init_dist.mean()
+            self.log_dict["spawn_dr_init_phi_abs_deg"] = self._spawn_dr_init_phi_deg.abs().mean()
+            self.log_dict["spawn_dr_init_yaw_abs_deg"] = self._spawn_dr_init_yaw_deg.abs().mean()
+            self.log_dict["spawn_dr_bin_yaw_abs_deg"] = torch.rad2deg(
+                self._spawn_bin_yaw_rad.abs()
+            ).mean()
 
         stage1 = self.stage_buf == self.STAGE_REACH
         metric_mask = stage1 if stage1.any() else torch.ones_like(stage1)
@@ -585,6 +873,18 @@ class BinPushHomie(
             self.log_dict[f"dist_{side}_grasppoint_to_hover_s2"] = (
                 (hover - gp).norm(dim=-1)[contact_mask].mean()
             )
+            # 2026-09-30: per-hand distance to the grasp-point target (where
+            # the grasp point sits with the palm link at the handle target
+            # pose; scored by grasp_bar_distance/progress when
+            # grasp_bar_reward_target="grasp_target"), and that target's own
+            # offset from the bar (geometric sanity check, expect ~0.0446).
+            gpt = self._grasp_point_targets()[0 if side == "left" else 1]
+            self.log_dict[f"grasp_target_dist_{side}_s2"] = (
+                (gpt - gp).norm(dim=-1)[contact_mask].mean()
+            )
+            self.log_dict[f"dist_{side}_grasptarget_to_bar_s2"] = (
+                (bar - gpt).norm(dim=-1)[contact_mask].mean()
+            )
             self.log_dict[f"dist_{side}_palmlink_to_bar_s2"] = (
                 (bar - plink).norm(dim=-1)[contact_mask].mean()
             )
@@ -623,6 +923,39 @@ class BinPushHomie(
         left_curl_frac, right_curl_frac = self._pregrasp_curl_fraction()
         self.log_dict["grasp_left_curl_frac_s2"] = left_curl_frac[contact_mask].mean()
         self.log_dict["grasp_right_curl_frac_s2"] = right_curl_frac[contact_mask].mean()
+        # 2026-09-28 handlefix5e: direct posture + measured-closure logging.
+        _jn = self.simulator.dof_names
+        _q = self.simulator.dof_pos
+        _deg = 57.29578
+        for _key, _joint in (
+            ("waist_pitch_deg_s2", "waist_pitch_joint"),
+            ("left_shoulder_yaw_deg_s2", "left_shoulder_yaw_joint"),
+            ("left_wrist_roll_deg_s2", "left_wrist_roll_joint"),
+            ("right_shoulder_yaw_deg_s2", "right_shoulder_yaw_joint"),
+            ("right_wrist_roll_deg_s2", "right_wrist_roll_joint"),
+        ):
+            self.log_dict[_key] = _q[contact_mask, _jn.index(_joint)].mean() * _deg
+        _reach = self.stage_buf == self.STAGE_REACH
+        if _reach.any():
+            self.log_dict["left_shoulder_yaw_deg_s1"] = (
+                _q[_reach, _jn.index("left_shoulder_yaw_joint")].mean() * _deg
+            )
+
+        def _closure(idx, p0, p1):
+            span = (p1 - p0)[None, :]
+            return ((_q[:, idx] - p0[None, :]) * span).sum(-1) / span.square().sum(-1).clamp(min=1e-6)
+
+        _lc = _closure(self._left_hand_dof_idx, self._left_p0, self._left_p1)
+        _rc = _closure(self._right_hand_dof_idx, self._right_p0, self._right_p1)
+        self.log_dict["grasp_left_closure_s2"] = _lc[contact_mask].mean()
+        self.log_dict["grasp_right_closure_s2"] = _rc[contact_mask].mean()
+        _gate = float(self.config.get("grasp_bar_valid_dist", 0.05))
+        self.log_dict["grasp_left_close_outside_gate_frac_s2"] = (
+            (_lc > 0.35) & (left_bar_dists > _gate)
+        )[contact_mask].float().mean()
+        self.log_dict["grasp_right_close_outside_gate_frac_s2"] = (
+            (_rc > 0.35) & (right_bar_dists > _gate)
+        )[contact_mask].float().mean()
         self.log_dict["grasp_both_required_contacts_frac_s2"] = (
             left_contact & right_contact
         )[contact_mask].float().mean()
@@ -691,6 +1024,14 @@ class BinPushHomie(
         self.log_dict["grasp_full_pose_valid_frac_s2"] = self._grasp_pose_valid_mask()[
             contact_mask
         ].float().mean()
+        # 2026-10-01: fraction of GRASP-stage envs passing the
+        # grasp_gate_min_closure part of the gate (both hands); only when set.
+        _gate_min_closure = self.config.get("grasp_gate_min_closure", None)
+        if _gate_min_closure is not None:
+            _glc, _grc = self._finger_closure_fractions()
+            self.log_dict["grasp_gate_closure_ok_frac_s2"] = (
+                (_glc >= float(_gate_min_closure)) & (_grc >= float(_gate_min_closure))
+            )[contact_mask].float().mean()
         signed_standoff, _, _ = self._grasp_standoff_state()
         min_standoff = float(self.config.get("min_grasp_standoff", 0.34))
         self.log_dict["grasp_standoff_s2"] = signed_standoff[contact_mask].mean()
@@ -726,6 +1067,208 @@ class BinPushHomie(
         self.log_dict["push_valid_grasp_frac_s3"] = self._grasp_pose_valid_mask()[
             push_mask
         ].float().mean()
+        # 2026-09-25: PUSH observability (logging only). How far / fast the bin
+        # moves while pushing, and how it tilts (positive tilt_back = top leaning
+        # toward the robot = the human "tip onto the wheels" posture).
+        bin_state = self.simulator.get_task_root_state("bin")
+        progress = self._bin_push_progress()
+        axis_xy = F.normalize(self.push_axis_world[:, :2], dim=-1)
+        vel_along = (bin_state[:, 7:9] * axis_xy).sum(dim=-1)
+        q = bin_state[:, 3:7]  # wxyz (see _palm_down_alignments)
+        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        up_z = (1.0 - 2.0 * (qx * qx + qy * qy)).clamp(-1.0, 1.0)
+        up_xy = torch.stack(
+            [2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx)], dim=-1
+        )
+        tilt_deg = torch.rad2deg(torch.acos(up_z))
+        tilt_back_deg = torch.rad2deg(
+            torch.asin((-(up_xy * axis_xy).sum(dim=-1)).clamp(-1.0, 1.0))
+        )
+        self.log_dict["push_progress_m_s3"] = progress[push_mask].mean()
+        self.log_dict["push_progress_max_m_s3"] = progress[push_mask].max()
+        self.log_dict["push_vel_s3"] = vel_along[push_mask].mean()
+        self.log_dict["bin_tilt_deg_s3"] = tilt_deg[push_mask].mean()
+        self.log_dict["bin_tilt_back_deg_s3"] = tilt_back_deg[push_mask].mean()
+        self.log_dict["bin_tilt_back_max_deg_s3"] = tilt_back_deg[push_mask].max()
+        # 2026-09-25 handlefix3: wrap / lid-contact observability (GRASP+PUSH).
+        # 2026-09-29 overhand: + TILT (the "_s23" suffix is kept for dashboard
+        # continuity; it means GRASP + the grasp-holding stages).
+        s23 = (self.stage_buf == self.STAGE_GRASP) | self._holding_stage_mask()
+        s23 = s23 if s23.any() else torch.ones_like(s23)
+        (wl, pl), (wr, pr) = self._finger_wrap_scores()
+        lid_l, lid_r = self._lid_contact_per_hand()
+        self.log_dict["wrap_worst_left_s23"] = wl.min(dim=-1).values[s23].mean()
+        self.log_dict["wrap_worst_right_s23"] = wr.min(dim=-1).values[s23].mean()
+        self.log_dict["wrap_mean_left_s23"] = wl.mean(dim=-1)[s23].mean()
+        self.log_dict["wrap_mean_right_s23"] = wr.mean(dim=-1)[s23].mean()
+        self.log_dict["tip_near_left_s23"] = pl.mean(dim=-1)[s23].mean()
+        self.log_dict["tip_near_right_s23"] = pr.mean(dim=-1)[s23].mean()
+        self.log_dict["lid_contact_left_s23"] = lid_l[s23].mean()
+        self.log_dict["lid_contact_right_s23"] = lid_r[s23].mean()
+        self.log_dict["lid_contact_any_frac_s23"] = ((lid_l + lid_r) > 0)[s23].float().mean()
+        # 2026-09-30 reach_grasp1 fix: palm grasp point height above the bar
+        # axis (bin frame, cm) and the fraction below grasp_palm_min_dz (0
+        # when unset), REACH + GRASP.
+        s12 = (self.stage_buf == self.STAGE_REACH) | (self.stage_buf == self.STAGE_GRASP)
+        s12 = s12 if s12.any() else torch.ones_like(s12)
+        min_dz = self._palm_min_dz() or 0.0
+        for side, d in zip(("left", "right"), self._palm_bar_deltas_bin()):
+            self.log_dict[f"palm_dz_{side}_s12"] = 100.0 * d[:, 2][s12].mean()
+            self.log_dict[f"palm_below_frac_{side}_s12"] = (d[:, 2] <= min_dz)[s12].float().mean()
+        self._update_overhand_tilt_logs(s23)
+
+    def _update_overhand_tilt_logs(self, s23):
+        """2026-09-29 overhand: overhand wrap score / per-finger bar distance,
+        TILT-stage and grip-maintenance observability. Logging only."""
+        # --- overhand wrap (GRASP + holding stages), per hand / per finger ---
+        if self._overhand_mode():
+            ovh = self._overhand_finger_terms()
+            names = ("index", "middle", "thumb")
+            for side, (score, dsurf_tip, dsurf_seg, hand_score, wrapped) in ovh.items():
+                self.log_dict[f"ovh_score_{side}_s23"] = hand_score[s23].mean()
+                self.log_dict[f"ovh_wrapped_frac_{side}_s23"] = wrapped[s23].float().mean()
+                for k, fname in enumerate(names):
+                    self.log_dict[f"ovh_{side}_{fname}_score_s23"] = score[:, k][s23].mean()
+                    self.log_dict[f"ovh_{side}_{fname}_dsurf_cm_s23"] = (
+                        100.0 * dsurf_seg[:, k][s23].mean()
+                    )
+            self.log_dict["ovh_both_wrapped_frac_s23"] = (
+                ovh["left"][4] & ovh["right"][4]
+            )[s23].float().mean()
+        # --- closure on the p0 -> p1 axis ---
+        lc, rc = self._finger_closure_fractions()
+        self.log_dict["closure_left_s23"] = lc[s23].mean()
+        self.log_dict["closure_right_s23"] = rc[s23].mean()
+        # --- grip maintained (loose check, I3) per holding stage ---
+        grip = self._grip_maintained_mask()
+        theta = self._bin_tilt_back_deg()
+        w_band = self._tilt_band_weight(theta)
+        self.log_dict["bin_tilt_back_deg_all"] = theta.mean()
+        lo = float(self.config.get("bin_topple_min_deg", -8.0))
+        hi = float(self.config.get("bin_topple_max_deg", 30.0))
+        self.log_dict["bin_topple_frac_all"] = ((theta < lo) | (theta > hi)).float().mean()
+        if self._tilt_enabled:
+            tilt = self.stage_buf == self.STAGE_TILT
+            tmask = tilt if tilt.any() else torch.ones_like(tilt)
+            band_lo = float(self.config.get("tilt_advance_min_deg", 10.0))
+            band_hi = float(self.config.get("tilt_advance_max_deg", 22.0))
+            self.log_dict["tilt_back_deg_tilt"] = theta[tmask].mean()
+            self.log_dict["tilt_back_max_deg_tilt"] = theta[tmask].max()
+            self.log_dict["tilt_in_band_frac_tilt"] = (
+                (theta >= band_lo) & (theta <= band_hi)
+            )[tmask].float().mean()
+            self.log_dict["tilt_hold_steps_mean_tilt"] = self._tilt_hold_steps[
+                tmask
+            ].float().mean()
+            # 2026-10-03 tilt7 (logging only): |tilt rate| of the TILT envs
+            # inside the band, and the fraction of them slow enough for the
+            # steady-hold gate (1.0 without tilt_advance_max_rate_dps). Kept
+            # from the previous step when no TILT env is in the band.
+            rate = self._bin_tilt_rate_dps()
+            band = tilt & (theta >= band_lo) & (theta <= band_hi)
+            if band.any():
+                rb = rate[band].abs()
+                self.log_dict["tilt_rate_abs_dps_band_tilt"] = rb.mean()
+                self.log_dict["tilt_steady_frac_band_tilt"] = (
+                    rb <= self._tilt_rate_thr_env[band]
+                ).float().mean()
+                # 2026-10-03 push2: steady-hold weight and forward vx command
+                # inside the TILT band (tracks tilt_walk_ramp_in_band).
+                self.log_dict["tilt_steady_weight_band_tilt"] = (
+                    self._tilt_steady_weight()[band].mean()
+                )
+                self.log_dict["homie_vx_cmd_band_tilt"] = (
+                    self.get_physical_homie_commands()[band, 0].mean()
+                )
+            if getattr(self, "_tilt_rate_gate", False):
+                # also the env-state-dict copy restored on resume
+                self.log_dict["tilt_gate_max_rate_dps"] = self.tilt_gate_max_rate_dps.clone()
+            self.log_dict["grip_maintained_frac_tilt"] = grip[tmask].float().mean()
+            # 2026-10-01: closure in TILT only (closure_*_s23 mixes GRASP +
+            # TILT); reach_grasp2 loosened its grip after entering TILT.
+            self.log_dict["closure_left_tilt"] = lc[tmask].mean()
+            self.log_dict["closure_right_tilt"] = rc[tmask].mean()
+            # 2026-10-01 tilt2: hand moment about the wheel contact line (+ =
+            # tips back), its clamped ratio to bin_tilt_moment_ref_Nm (NOT
+            # grip-gated, unlike the reward) and total hand-on-bin force.
+            m_tilt, f_tilt = self._bin_tilt_moment_terms()
+            ref_tilt = float(self.config.get("bin_tilt_moment_ref_Nm", self.BIN_TILT_MOMENT_REF_NM))
+            self.log_dict["tilt_moment_Nm_tilt"] = m_tilt[tmask].mean()
+            self.log_dict["tilt_moment_frac_tilt"] = (
+                (m_tilt / max(ref_tilt, 1e-3)).clamp(0.0, 1.0)[tmask].mean()
+            )
+            self.log_dict["hand_force_N_tilt"] = f_tilt[tmask].mean()
+            # 2026-10-01 tilt3: with bin_tilt_moment_friction the three logs
+            # above include friction; keep the normal-only moment (what tilt1/
+            # tilt2 logged and paid for) for comparison.
+            if bool(self.config.get("bin_tilt_moment_friction", False)):
+                f_nrm = self.BIN_TILT_MOMENT_FORCE_SIGN * self.simulator.object_to_hand_contact_forces[
+                    :, 0, :, :
+                ]
+                self.log_dict["tilt_moment_normal_Nm_tilt"] = self._bin_hand_moment(f_nrm)[tmask].mean()
+            # 2026-10-01 tilt2: body (non-hand/wrist/foot links) contact with
+            # the bin in TILT: mean force and fraction above 50 N (chest brace).
+            bf_tilt = self._body_bin_contact_force()
+            self.log_dict["body_bin_contact_N_tilt"] = bf_tilt[tmask].mean()
+            self.log_dict["body_bin_contact_frac_tilt"] = (bf_tilt > 50.0)[tmask].float().mean()
+        push = self.stage_buf == self.STAGE_PUSH
+        pmask = push if push.any() else torch.ones_like(push)
+        self.log_dict["grip_maintained_frac_push"] = grip[pmask].float().mean()
+        self.log_dict["w_tilt_push"] = w_band[pmask].mean()
+        self.log_dict["push_force_nomoment_N_push"] = self._push_force_nomoment_raw()[
+            pmask
+        ].mean()
+        self.log_dict["push_force_line_below_horiz_deg"] = torch.rad2deg(
+            torch.asin((-self._push_line_dir[:, 2]).clamp(-1.0, 1.0))
+        ).mean()
+        self.log_dict["grip_invalid_steps_mean_hold"] = self._push_invalid_grasp_steps[
+            s23
+        ].float().mean()
+        if getattr(self, "_push_dist_cur", False):
+            # also the env-state-dict copy restored on resume
+            self.log_dict["target_bin_push_distance_m"] = (
+                self.target_bin_push_distance_m.clone()
+            )
+        # 2026-10-03 push1 (push_stage_logs, default False): PUSH-stage
+        # observability over envs IN PUSH only (skipped while none are, so the
+        # last value carries; the *_push logs above fall back to all envs).
+        if bool(self.config.get("push_stage_logs", False)) and push.any():
+            prog = self._bin_push_progress()
+            bar_prog = self._bin_bar_push_progress()
+            axis = F.normalize(self.push_axis_world[:, :2], dim=-1)
+            root_v = (self.simulator.robot_root_states[:, 7:9] * axis).sum(dim=-1)
+            bin_v = (self.simulator.get_task_root_state("bin")[:, 7:9] * axis).sum(dim=-1)
+            bar_v = self._bar_fwd_vel()
+            vx_cmd = self.get_physical_homie_commands()[:, 0]
+            p_lo = float(self.config.get("push_complete_min_tilt_deg", 5.0))
+            p_hi = float(self.config.get("push_complete_max_tilt_deg", 25.0))
+            db = float(self.config.get("push_cmd_deadband", 0.1))
+            self.log_dict["push_frac_envs"] = push.float().mean()
+            self.log_dict["push_progress_m_push"] = prog[push].mean()
+            self.log_dict["push_progress_max_m_push"] = prog[push].max()
+            self.log_dict["push_bar_progress_m_push"] = bar_prog[push].mean()
+            self.log_dict["tilt_back_deg_push"] = theta[push].mean()
+            self.log_dict["tilt_in_band_frac_push"] = (
+                (theta >= p_lo) & (theta <= p_hi)
+            )[push].float().mean()
+            self.log_dict["tilt_rate_abs_dps_push"] = (
+                self._bin_tilt_rate_dps()[push].abs().mean()
+            )
+            self.log_dict["tilt_steady_weight_push"] = (
+                self._tilt_steady_weight()[push].mean()
+            )
+            self.log_dict["homie_vx_cmd_push"] = vx_cmd[push].mean()
+            self.log_dict["walk_cmd_frac_push"] = (vx_cmd > db)[push].float().mean()
+            self.log_dict["pelvis_fwd_vel_push"] = root_v[push].mean()
+            self.log_dict["bin_fwd_vel_push"] = bin_v[push].mean()
+            self.log_dict["bar_fwd_vel_push"] = bar_v[push].mean()
+            if bool(self.config.get("push_anti_stall_enable", False)):
+                self.log_dict["push_anti_stall_weight_push"] = (
+                    self._push_motion_anti_stall_weight()[push].mean()
+                )
+            self.log_dict["body_bin_contact_frac_push"] = (
+                self._body_bin_contact_force() > 50.0
+            )[push].float().mean()
 
     # --- observation getters ---
 
@@ -791,8 +1334,12 @@ class BinPushHomie(
     def _get_obs_privileged_bin_info(self):
         """6-D privileged info: [mass, ground_friction, wheel_stiffness,
         push_target_distance, push_axis_x, push_axis_y]."""
-        push_axis_x = self.push_axis_world[:, 0]
-        push_axis_y = self.push_axis_world[:, 1]
+        if bool(self.config.get("privileged_bin_info_ego_push_axis", True)):
+            push_axis_x = torch.ones_like(self._privileged_bin_mass)
+            push_axis_y = torch.zeros_like(self._privileged_bin_mass)
+        else:
+            push_axis_x = self.push_axis_world[:, 0]
+            push_axis_y = self.push_axis_world[:, 1]
         push_target = torch.full(
             (self.num_envs,), self.target_bin_push_distance, device=self.device
         )
@@ -1000,9 +1547,10 @@ class BinPushHomie(
 
     def _palm_down_alignments(self):
         """Cosine alignment of each anatomical palm face with bin-down."""
-        bin_quat_xyzw = self.simulator.get_task_root_state("bin")[:, 3:7]
+        # get_task_root_state returns wxyz (same as L375); do NOT reorder.
+        bin_quat_wxyz = self.simulator.get_task_root_state("bin")[:, 3:7]
         bin_up = quat_apply(
-            xyzw_to_wxyz(bin_quat_xyzw),
+            bin_quat_wxyz,
             torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(
                 self.num_envs, 1
             ),
@@ -1021,6 +1569,16 @@ class BinPushHomie(
             right_axis,
         )
         desired = -F.normalize(bin_up, dim=-1)
+        if bool(self.config.get("grasp_palm_align_from_target", False)):
+            # 2026-09-28 handlefix5: desired palm-face direction = the target
+            # frame's palm axis (== -bin_up for the old palm-down target), so
+            # every consumer follows the configured grasp orientation.
+            left_des = quat_apply(xyzw_to_wxyz(self._left_handle_target_rot()), left_axis)
+            right_des = quat_apply(xyzw_to_wxyz(self._right_handle_target_rot()), right_axis)
+            return (
+                (left_world * F.normalize(left_des, dim=-1)).sum(dim=-1).clamp(-1.0, 1.0),
+                (right_world * F.normalize(right_des, dim=-1)).sum(dim=-1).clamp(-1.0, 1.0),
+            )
         return (
             (left_world * desired).sum(dim=-1).clamp(min=-1.0, max=1.0),
             (right_world * desired).sum(dim=-1).clamp(min=-1.0, max=1.0),
@@ -1104,6 +1662,75 @@ class BinPushHomie(
             lateral_error < lateral_tolerance
         )
 
+    def _spawn_polar_active_bounds(self):
+        """2026-10-06 full3: active (d_min_m, d_max_m, phi_max_deg, fov_yaw_max_deg)
+        for Polar STAGE_APPROACH Spawn DR, interpolating phi and fov_yaw with
+        spawn_dr_dist_level_m when spawn_polar_curriculum is enabled."""
+        d_min = float(self.config.get("spawn_polar_dist_min_m", 0.02))
+        d_start = float(self.config.get("spawn_polar_dist_start_m", 0.25))
+        d_max_full = float(self.config.get("spawn_polar_dist_max_m", 1.10))
+        phi_start = float(self.config.get("spawn_polar_phi_start_deg", 15.0))
+        phi_max_full = float(self.config.get("spawn_polar_phi_max_deg", 45.0))
+        yaw_start = float(self.config.get("spawn_polar_fov_yaw_start_deg", 10.0))
+        yaw_max_full = float(self.config.get("spawn_polar_fov_yaw_max_deg", 20.0))
+        if not getattr(self, "_spawn_polar_cur", False):
+            return d_min, d_max_full, phi_max_full, yaw_max_full
+        lvl = float(self.spawn_dr_dist_level_m)
+        denom = max(d_max_full - d_start, 1e-6)
+        alpha = min(max((lvl - d_start) / denom, 0.0), 1.0)
+        phi_cur = phi_start + alpha * (phi_max_full - phi_start)
+        yaw_cur = yaw_start + alpha * (yaw_max_full - yaw_start)
+        return d_min, lvl, phi_cur, yaw_cur
+
+    def _approach_yaw_error_rad(self):
+        """2026-10-06 full3: signed yaw error (rad) in [-pi, pi] between robot
+        heading and the grasp-face inward direction (-face_normal). When the
+        bin is at its default yaw (+X), -face_normal = (+1, 0), so yaw error is 0
+        when robot faces +X."""
+        handle_mid = 0.5 * (
+            self._left_handle_target()[:, :2] + self._right_handle_target()[:, :2]
+        )
+        inward = self._bin_center_xy() - handle_mid
+        target_yaw = torch.atan2(inward[:, 1], inward[:, 0])
+        _, _, robot_yaw = euler_xyz_from_quat(
+            xyzw_to_wxyz(self.simulator.robot_root_states[:, 3:7])
+        )
+        diff = robot_yaw - target_yaw
+        return torch.atan2(torch.sin(diff), torch.cos(diff))
+
+    def _approach_yaw_ready_mask(self):
+        """2026-10-06 full3: True if |approach_yaw_error| < stop_transition_yaw_tolerance_deg
+        (or all-True when stop_transition_yaw_tolerance_deg is None)."""
+        tol_deg = self.config.get("stop_transition_yaw_tolerance_deg", None)
+        if tol_deg is None:
+            return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        tol_rad = math.radians(float(tol_deg))
+        return self._approach_yaw_error_rad().abs() < tol_rad
+
+    def _bar_mid_xy(self):
+        """2026-10-03 push2: world XY of the handle-bar midpoint (N, 2)."""
+        return 0.5 * (self._left_bar_raw_pos()[:, :2] + self._right_bar_raw_pos()[:, :2])
+
+    def _bar_fwd_vel(self):
+        """2026-10-03 push2: handle-bar midpoint linear velocity along pushAxisWorld (m/s)."""
+        st = self.simulator.get_task_root_state("bin")
+        bar_mid = 0.5 * (self._left_bar_raw_pos() + self._right_bar_raw_pos())
+        bar_vel = st[:, 7:10] + torch.cross(st[:, 10:13], bar_mid - st[:, :3], dim=-1)
+        axis_unit = F.normalize(self.push_axis_world, dim=-1)
+        return (bar_vel * axis_unit).sum(dim=-1)
+
+    def _bin_bar_push_progress(self):
+        """2026-10-03 push2: handle-bar midpoint displacement along pushAxisWorld (m)."""
+        delta_xy = self._bar_mid_xy() - self._initial_bar_pos_xy
+        axis_unit = F.normalize(self.push_axis_world[:, :2], dim=-1)
+        return (delta_xy * axis_unit).sum(dim=-1)
+
+    def _target_bin_push_distance_m(self):
+        """2026-10-03 push2: active PUSH target distance (m), curriculum-aware."""
+        if getattr(self, "_push_dist_cur", False):
+            return float(self.target_bin_push_distance_m)
+        return float(self.config.get("target_bin_push_distance", 1.0))
+
     def _bin_push_progress(self):
         """Bin displacement along pushAxisWorld (scalar per env, meters)."""
         current_xy = self.simulator.get_task_root_state("bin")[:, :2]
@@ -1111,7 +1738,13 @@ class BinPushHomie(
         axis_xy = self.push_axis_world[:, :2]
         axis_norm = axis_xy.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         axis_unit = axis_xy / axis_norm
-        return (delta_xy * axis_unit).sum(dim=-1)
+        root_prog = (delta_xy * axis_unit).sum(dim=-1)
+        if bool(self.config.get("push_progress_use_bar_min", False)):
+            # 2026-10-03 push2: tipping the bin back around the handle swings
+            # the bottom root +0.16 m forward without any translation; min of
+            # root and bar progress requires both wheels and handle to advance.
+            return torch.minimum(root_prog, self._bin_bar_push_progress())
+        return root_prog
 
     def _hand_bar_distances(self):
         """Per-hand palm-to-bar-target distance (num_envs,) x2, world frame.
@@ -1295,12 +1928,25 @@ class BinPushHomie(
         if self.config.get("enable_continuous_grasp_readiness", False):
             threshold = float(self.config.get("grasp_readiness_threshold", 0.5))
             left_r, right_r = self._grasp_readiness_score()
-            return left_r > threshold, right_r > threshold
+            left_above, right_above = self._palm_above_bar_masks()  # 2026-09-30
+            return (left_r > threshold) & left_above, (right_r > threshold) & right_above
 
         # --- Original 5-condition AND-gate (LIVE DEFAULT as of 2026-08-27) ---
         # 2026-08-29: "contact" condition is now bar-distance-based, see
         # _hand_bar_distances.
-        bar_valid_dist = float(self.config.get("grasp_bar_valid_dist", 0.03))
+        # 2026-09-24: finger-close proximity decoupled from the GRASP->PUSH
+        # success gate. With open fingers the hands rest flat on the lid and
+        # cannot get within grasp_bar_valid_dist (5cm) of the bar, but fingers
+        # only close once inside it -- a deadlock (diag rollout of step 4200:
+        # best worst-hand dist 6.4cm, palms ~5cm above the bar). A looser
+        # close radius lets the fingers curl over the lid lip toward the bar.
+        # Falls back to grasp_bar_valid_dist when unset (old behaviour).
+        bar_valid_dist = float(
+            self.config.get(
+                "grasp_finger_close_bar_dist",
+                self.config.get("grasp_bar_valid_dist", 0.03),
+            )
+        )
         close_dist_horiz = float(
             self.config.get("grasp_finger_close_horiz_dist", 0.04)
         )
@@ -1340,7 +1986,33 @@ class BinPushHomie(
             & (right_alignment > min_alignment)
             & (right_twist < max_twist_error)
         )
-        return left_ready, right_ready
+        # 2026-09-30: palm above the bar (grasp_palm_min_dz, default off).
+        left_above, right_above = self._palm_above_bar_masks()
+        return left_ready & left_above, right_ready & right_above
+
+    def _palm_bar_deltas_bin(self):
+        """2026-09-30: (palm grasp point - that hand's raw bar point) in the
+        BIN frame (x along the bar, y horizontal across it, z up), per hand."""
+        left_palm, right_palm = self._palm_grasp_points()
+        q_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])  # wxyz
+        return (
+            quat_apply(q_inv, left_palm - self._left_bar_raw_pos()),
+            quat_apply(q_inv, right_palm - self._right_bar_raw_pos()),
+        )
+
+    def _palm_min_dz(self):
+        v = self.config.get("grasp_palm_min_dz", None)
+        return None if v is None else float(v)
+
+    def _palm_above_bar_masks(self):
+        """2026-09-30: per-hand bool, palm grasp point height above the bar
+        axis (bin frame) > grasp_palm_min_dz; all True when the key is unset."""
+        min_dz = self._palm_min_dz()
+        if min_dz is None:
+            ones = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            return ones, ones
+        ld, rd = self._palm_bar_deltas_bin()
+        return ld[:, 2] > min_dz, rd[:, 2] > min_dz
 
     def _reach_transition_ready_mask(self):
         """Instantaneous REACH readiness before applying the hold duration."""
@@ -1351,11 +2023,14 @@ class BinPushHomie(
         right_close = (
             right_palm - self._right_handle_target()
         ).norm(dim=-1) < 0.15
+        # 2026-09-24: "open" now means "at the pre-shape pose" (p0 when
+        # finger_preshape_frac=0) -- see _finger_preshape_poses.
+        left_pre, right_pre = self._finger_preshape_poses()
         left_open = (
-            self.simulator.dof_pos[:, self._left_hand_dof_idx] - self._left_p0
+            self.simulator.dof_pos[:, self._left_hand_dof_idx] - left_pre
         ).abs().mean(dim=-1) < 0.174533
         right_open = (
-            self.simulator.dof_pos[:, self._right_hand_dof_idx] - self._right_p0
+            self.simulator.dof_pos[:, self._right_hand_dof_idx] - right_pre
         ).abs().mean(dim=-1) < 0.174533
         homie_still = (
             torch.norm(self.get_physical_homie_commands()[:, :3], dim=1) <= 0.1
@@ -1378,7 +2053,8 @@ class BinPushHomie(
     def _finger_control_masks(self):
         in_reach = self.stage_buf == self.STAGE_REACH
         in_grasp = self.stage_buf == self.STAGE_GRASP
-        in_push = self.stage_buf == self.STAGE_PUSH
+        # 2026-09-29 overhand: TILT holds the grasp exactly like PUSH.
+        in_push = self._holding_stage_mask()
         left_ready, right_ready = self._finger_close_ready()
         self._left_finger_close_latched &= in_grasp
         self._right_finger_close_latched &= in_grasp
@@ -1397,6 +2073,33 @@ class BinPushHomie(
         self._delta_actions[env_mask, delta_idx] = target
         self._last_delta_actions[env_mask, delta_idx] = 0.0
         actor_state["actions"][env_mask, action_idx] = target
+
+    def _finger_preshape_poses(self):
+        """2026-09-24: partially-curled "hook" pre-shape finger pose per hand,
+        p_pre = p0 + finger_preshape_frac * (p1 - p0). Used as the REACH-stage
+        finger target (reward, reach-position finger gate, and REACH->GRASP
+        transition) instead of the fully open p0, so the hand ARRIVES
+        pre-curled like a human reaching for a handle rather than landing flat
+        on the lid and trying to curl too late (video review of step 4200/4700:
+        fingers flat on the lid, curling blocked by the lid surface).
+        finger_preshape_frac defaults to 0.0 == p0 == previous behaviour."""
+        alpha = float(self.config.get("finger_preshape_frac", 0.0))
+        # 2026-09-24 (#1): distance-graded, per env. Fingers stay OPEN in
+        # APPROACH; in REACH the curl ramps 0 -> alpha as the grasp point
+        # closes from finger_preshape_start_dist to finger_preshape_full_dist
+        # of the hover (pre-grasp) target. Returns (num_envs, n_finger_dof).
+        d_start = float(self.config.get("finger_preshape_start_dist", 0.25))
+        d_full = float(self.config.get("finger_preshape_full_dist", 0.05))
+        left_gp, right_gp = self._palm_grasp_points()
+        left_d = (left_gp - self._left_handle_target()).norm(dim=-1)
+        right_d = (right_gp - self._right_handle_target()).norm(dim=-1)
+        span = max(d_start - d_full, 1e-6)
+        in_reach = (self.stage_buf == self.STAGE_REACH).float()
+        left_a = alpha * in_reach * ((d_start - left_d) / span).clamp(0.0, 1.0)
+        right_a = alpha * in_reach * ((d_start - right_d) / span).clamp(0.0, 1.0)
+        left = self._left_p0[None, :] + left_a[:, None] * (self._left_p1 - self._left_p0)[None, :]
+        right = self._right_p0[None, :] + right_a[:, None] * (self._right_p1 - self._right_p0)[None, :]
+        return left, right
 
     def _pregrasp_curl_fraction(self):
         """Distance-graded finger-primitive curl fraction, in [0, 1] per
@@ -1502,7 +2205,20 @@ class BinPushHomie(
         -- becomes live for fingers for the first time. Not a bug; watch it
         in early logs rather than mistaking a dip there for a regression.
         """
-        pass
+        decay = float(self.config.get("approach_arm_delta_decay", 0.0))
+        if decay > 0.0:
+            in_app = self.stage_buf == self.STAGE_APPROACH
+            if in_app.any():
+                st = self._resting_action_state()
+                u_cols = st["upper_delta_cols"]
+                rest_u = st["delta"][u_cols].unsqueeze(0)
+                cur_u = self._delta_actions[:, u_cols]
+                blended = (1.0 - decay) * cur_u + decay * rest_u
+                self._delta_actions[:, u_cols] = torch.where(
+                    in_app.unsqueeze(-1), blended, cur_u
+                )
+                act_cols = self._delta_action_indices[u_cols]
+                actor_state["actions"][:, act_cols] = self._delta_actions[:, u_cols]
 
     def _enforce_whole_body_finger_actions(self, actions):
         """Superseded 2026-08-27 -- see _postprocess_delta_actions's
@@ -1565,7 +2281,8 @@ class BinPushHomie(
     @override
     def _load_delta_actions_buffer(self, env_ids, data):
         super()._load_delta_actions_buffer(env_ids, data)
-        pre_push = self.stage_buf[env_ids] != self.STAGE_PUSH
+        # 2026-09-29 overhand: TILT keeps the (closed) finger delta like PUSH.
+        pre_push = ~self._holding_stage_mask(self.stage_buf[env_ids])
         open_env_ids = env_ids[pre_push]
         self._delta_actions[open_env_ids, self._left_finger_delta_idx] = (
             self._finger_open_action
@@ -1622,7 +2339,34 @@ class BinPushHomie(
         """
         bar_valid_dist = float(self.config.get("grasp_bar_valid_dist", 0.03))
         left_dist, right_dist = self._hand_bar_distances()
-        return (left_dist < bar_valid_dist) & (right_dist < bar_valid_dist)
+        valid = (left_dist < bar_valid_dist) & (right_dist < bar_valid_dist)
+        # 2026-09-30 reach_grasp1 fix: the distance gate is direction-blind --
+        # the left palm settled UNDER the bar (dz -4..-5 cm) at the same 5 cm.
+        # grasp_palm_min_dz (default None = off) requires each palm grasp
+        # point to sit above the bar axis (bin frame).
+        left_above, right_above = self._palm_above_bar_masks()
+        valid = valid & left_above & right_above
+        # 2026-10-01 reach_grasp2 finding: the right hand entered TILT at
+        # closure 0.35-0.39 (gate is geometry-only) and then loosened.
+        # grasp_gate_min_closure (default None = off) additionally requires
+        # BOTH hands' p0->p1 closure >= the value. Placed before the overhand
+        # branch so it covers both gate paths. Not applied to finger_close_ready.
+        min_closure = self.config.get("grasp_gate_min_closure", None)
+        if min_closure is not None:
+            lc, rc = self._finger_closure_fractions()
+            valid = valid & (lc >= float(min_closure)) & (rc >= float(min_closure))
+        min_wrap = float(self.config.get("grasp_gate_min_wrap", 0.0))
+        if self._overhand_mode():
+            # 2026-09-29 overhand: hand counts as wrapped only if its overhand
+            # score > grasp_gate_min_wrap AND every finger (index, middle,
+            # thumb) is within grasp_finger_max_bar_dist of the bar surface.
+            ovh = self._overhand_finger_terms()
+            return valid & ovh["left"][4] & ovh["right"][4]
+        if min_wrap > 0.0:
+            # 2026-09-28 handlefix5: distance alone passed fingers-on-the-lid.
+            lw, rw = self._wrap_hand_scores()
+            valid = valid & (lw > min_wrap) & (rw > min_wrap)
+        return valid
 
     def _grasp_force_sustained_mask(self):
         """PUSH-stage grip-QUALITY check: _grasp_pose_valid_mask() (pure
@@ -1669,6 +2413,16 @@ class BinPushHomie(
 
     def _update_grasp_validity_counters(self, env_ids):
         active = ~self.just_resetted_buf[env_ids]
+        approach_ready = self._approach_transition_ready_mask()[env_ids]
+        approach_steps = self._approach_transition_ready_steps[env_ids]
+        self._approach_transition_ready_steps[env_ids] = torch.where(
+            active
+            & (self.stage_buf[env_ids] == self.STAGE_APPROACH)
+            & approach_ready,
+            approach_steps + 1,
+            torch.zeros_like(approach_steps),
+        )
+
         reach_ready = self._reach_transition_ready_mask()[env_ids]
         reach_steps = self._reach_transition_ready_steps[env_ids]
         self._reach_transition_ready_steps[env_ids] = torch.where(
@@ -1693,15 +2447,314 @@ class BinPushHomie(
         # only `valid` used above for GRASP-stage entry counting -- see that
         # method's docstring. Losing real grip force, not just drifting a few
         # cm, is what should start the grasp-loss grace-period clock.
-        force_sustained = self._grasp_force_sustained_mask()[env_ids]
+        # 2026-09-29 overhand (I3): counted in every grasp-holding stage
+        # (TILT + PUSH); with push_grip_loose_check the check is the loose
+        # _grip_maintained_mask (palm < 8cm AND closure > 60%) instead.
+        if bool(self.config.get("push_grip_loose_check", False)):
+            grip_ok = self._grip_maintained_mask()[env_ids]
+        else:
+            grip_ok = self._grasp_force_sustained_mask()[env_ids]
         invalid_push_steps = self._push_invalid_grasp_steps[env_ids]
         self._push_invalid_grasp_steps[env_ids] = torch.where(
             active
-            & (self.stage_buf[env_ids] == self.STAGE_PUSH)
-            & ~force_sustained,
+            & self._holding_stage_mask(self.stage_buf[env_ids])
+            & ~grip_ok,
             invalid_push_steps + 1,
             torch.zeros_like(invalid_push_steps),
         )
+        # 2026-09-29 overhand: TILT->PUSH hold counter (bin inside the tilt
+        # band while the grip is maintained).
+        if self._tilt_enabled:
+            theta = self._bin_tilt_back_deg()[env_ids]
+            lo = float(self.config.get("tilt_advance_min_deg", 10.0))
+            hi = float(self.config.get("tilt_advance_max_deg", 22.0))
+            in_band = (theta >= lo) & (theta <= hi)
+            tilt_steps = self._tilt_hold_steps[env_ids]
+            hold_ok = (
+                active
+                & (self.stage_buf[env_ids] == self.STAGE_TILT)
+                & in_band
+                & self._grip_maintained_mask()[env_ids]
+            )
+            # 2026-10-03 tilt7 (tilt_advance_max_rate_dps): steady-hold gate --
+            # a step only counts while |d tilt/dt| <= the episode's threshold
+            # (tilt5 / push1 handed over mid-swing at ~+31 deg/s: the 10-step
+            # hold was met by swinging through the band).
+            if getattr(self, "_tilt_rate_gate", False):
+                hold_ok = hold_ok & (
+                    self._bin_tilt_rate_dps()[env_ids].abs()
+                    <= self._tilt_rate_thr_env[env_ids]
+                )
+            self._tilt_hold_steps[env_ids] = torch.where(
+                hold_ok,
+                tilt_steps + 1,
+                torch.zeros_like(tilt_steps),
+            )
+            if bool(self.config.get("reanchor_bar_on_push_settle", False)):
+                # 2026-10-03 push4: if the bin settles slightly deeper inside
+                # [lo, hi] during the first push_settle_reanchor_steps (15 =
+                # 0.3 s) of PUSH without rolling backward, re-anchor
+                # _initial_bar_pos_xy so the small backward handle arc from
+                # settling (e.g. 11 -> 14 deg = -4.5 cm) does not create a
+                # negative bar-progress debt before forward walking begins.
+                settle_steps = int(self.config.get("push_settle_reanchor_steps", 15))
+                in_push_settle = (
+                    active
+                    & (self.stage_buf[env_ids] == self.STAGE_PUSH)
+                    & (self.time_in_stage_buf[env_ids] <= settle_steps)
+                    & in_band
+                    & (self._bin_bar_push_progress()[env_ids] < 0.0)
+                )
+                if in_push_settle.any():
+                    s_ids = env_ids[in_push_settle]
+                    self._initial_bar_pos_xy[s_ids] = self._bar_mid_xy()[s_ids]
+
+    # ----------------------------------------------------------------
+    # 2026-09-29 overhand: shared helpers for the overhand claw grasp and the
+    # TILT / PUSH stages.
+    # ----------------------------------------------------------------
+    def _finger_closure_fractions(self):
+        """Per-hand finger closure on the p0 -> p1 primitive axis (N,) x2:
+        projection of (q - p0) onto (p1 - p0), 0 = p0, 1 = p1. Same measure as
+        the grasp_*_closure_s2 logs (handlefix5e)."""
+        q = self.simulator.dof_pos
+
+        def _closure(idx, p0, p1):
+            span = (p1 - p0)[None, :]
+            return ((q[:, idx] - p0[None, :]) * span).sum(-1) / span.square().sum(
+                -1
+            ).clamp(min=1e-6)
+
+        return (
+            _closure(self._left_hand_dof_idx, self._left_p0, self._left_p1),
+            _closure(self._right_hand_dof_idx, self._right_p0, self._right_p1),
+        )
+
+    def _grip_maintained_mask(self):
+        """'Grip maintained' for TILT/PUSH (I3). With push_grip_loose_check:
+        both palms' grasp points within push_grip_max_bar_dist (0.08) of the
+        bar AND both closures (p0->p1 axis) above push_grip_min_closure (0.6).
+        Without it: the strict _grasp_pose_valid_mask (old behaviour).
+
+        2026-10-03 push4: optional push_stage_grip_max_bar_dist /
+        push_stage_grip_min_closure override the thresholds in STAGE_PUSH only
+        (default = the TILT thresholds), allowing slight palm/wrist compliance
+        during the dynamic TILT->PUSH stepping handover."""
+        if not bool(self.config.get("push_grip_loose_check", False)):
+            return self._grasp_pose_valid_mask()
+        max_d = float(self.config.get("push_grip_max_bar_dist", 0.08))
+        min_c = float(self.config.get("push_grip_min_closure", 0.6))
+        push_max_d = float(self.config.get("push_stage_grip_max_bar_dist", max_d))
+        push_min_c = float(self.config.get("push_stage_grip_min_closure", min_c))
+        ld, rd = self._hand_bar_distances()
+        lc, rc = self._finger_closure_fractions()
+        if push_max_d != max_d or push_min_c != min_c:
+            in_push = self.stage_buf == self.STAGE_PUSH
+            max_d = torch.where(
+                in_push,
+                torch.full_like(ld, push_max_d),
+                torch.full_like(ld, max_d),
+            )
+            min_c = torch.where(
+                in_push,
+                torch.full_like(lc, push_min_c),
+                torch.full_like(lc, min_c),
+            )
+        return (ld < max_d) & (rd < max_d) & (lc > min_c) & (rc > min_c)
+
+    def _tilt_band_weight(self, theta=None):
+        """w_tilt = clamp((th-lo)/lo_ramp,0,1) * clamp((hi-th)/hi_ramp,0,1):
+        0 for a flat bin, 1 between 10 and 22 deg, 0 again by 25 deg
+        (defaults lo=5, lo_ramp=5, hi=25, hi_ramp=3)."""
+        theta = self._bin_tilt_back_deg() if theta is None else theta
+        lo = float(self.config.get("tilt_band_lo_deg", 5.0))
+        lo_ramp = float(self.config.get("tilt_band_lo_ramp_deg", 5.0))
+        hi = float(self.config.get("tilt_band_hi_deg", 25.0))
+        hi_ramp = float(self.config.get("tilt_band_hi_ramp_deg", 3.0))
+        return ((theta - lo) / lo_ramp).clamp(0.0, 1.0) * (
+            (hi - theta) / hi_ramp
+        ).clamp(0.0, 1.0)
+
+    def _overhand_mode(self):
+        return str(self.config.get("grasp_wrap_mode", "hook")) == "overhand"
+
+    def _overhand_finger_terms(self):
+        """Overhand claw wrap terms per hand (grasp_wrap_mode: overhand).
+
+        Bin frame (see the handlefix3 block above _init_hand_link_indices):
+        +x along the bar, +y from the lid toward the robot, +z up, measured
+        from each hand's raw bar point (bar centre). Uses the REAL fingertip
+        points (distal link origin + _overhand_tip_offsets).
+          * index / middle: in-slot = smooth indicator of
+            dy in [grasp_ovh_slot_dy_min, -R_BAR] (slot between bar and lid)
+            AND dz < 0 (below the bar centre), times exp(-(d_surf/sigma)^2)
+            with d_surf = hypot(dy, dz) - R_BAR at the tip.
+          * thumb: under / in front of the bar: dz < 0 AND
+            dy > grasp_ovh_thumb_dy_min (-1cm), times the same proximity.
+          * hand score = (1-w) mean + w min over the three fingers
+            (w = grasp_wrap_worst_weight, same semantics as the hook score).
+          * wrapped = hand score > grasp_gate_min_wrap AND EVERY finger's
+            distal phalanx (segment link-origin -> tip, in the bar's
+            cross-section plane) within grasp_finger_max_bar_dist of the bar
+            surface.
+        Returns {side: (score (N,3), dsurf_tip (N,3), dsurf_seg (N,3),
+        hand_score (N,), wrapped (N,) bool)}, fingers ordered
+        (index, middle, thumb).
+        """
+        self._init_hand_link_indices()
+        k = float(self.config.get("grasp_ovh_edge_width", 0.003))
+        sigma = float(self.config.get("grasp_ovh_sigma", 0.01))
+        dy_min = float(self.config.get("grasp_ovh_slot_dy_min", -0.042))
+        dy_max = float(self.config.get("grasp_ovh_slot_dy_max", -_BAR_RADIUS))
+        thumb_dy_min = float(self.config.get("grasp_ovh_thumb_dy_min", -0.01))
+        max_dist = float(self.config.get("grasp_finger_max_bar_dist", 0.01))
+        w = float(self.config.get("grasp_wrap_worst_weight", 0.5))
+        min_score = float(self.config.get("grasp_gate_min_wrap", 0.5))
+        q_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])  # wxyz
+        out = {}
+        self._ovh_last_sub = {}
+        self._ovh_last_variants = {}
+        self._ovh_last_tip = {}
+        for side, bar in (
+            ("left", self._left_bar_raw_pos()),
+            ("right", self._right_bar_raw_pos()),
+        ):
+            idx = self._overhand_link_idx(side)  # (3,) index, middle, thumb
+            n_k = idx.numel()
+            origin_w = self.simulator._rigid_body_pos[:, idx, :]
+            rot_w = xyzw_to_wxyz(self.simulator._rigid_body_rot[:, idx, :].reshape(-1, 4))
+            tip_w = origin_w + quat_apply(
+                rot_w,
+                self._overhand_tip_offsets(side).expand(self.num_envs, -1, -1).reshape(-1, 3),
+            ).reshape(self.num_envs, n_k, 3)
+            qi = q_inv[:, None, :].expand(-1, n_k, 4).reshape(-1, 4)
+            tip = quat_apply(qi, (tip_w - bar[:, None, :]).reshape(-1, 3)).reshape(
+                self.num_envs, n_k, 3
+            )
+            org = quat_apply(qi, (origin_w - bar[:, None, :]).reshape(-1, 3)).reshape(
+                self.num_envs, n_k, 3
+            )
+            dy, dz = tip[..., 1], tip[..., 2]
+            dsurf_tip = torch.sqrt(dy * dy + dz * dz + 1e-10) - _BAR_RADIUS
+            is_thumb = torch.zeros(n_k, dtype=torch.bool, device=self.device)
+            is_thumb[-1] = True
+            # Distal phalanx segment distance to the bar axis (cross-section).
+            p0 = org[..., 1:3]
+            seg = tip[..., 1:3] - p0
+            t = (-(p0 * seg).sum(-1) / seg.square().sum(-1).clamp(min=1e-10)).clamp(0.0, 1.0)
+            closest = p0 + t[..., None] * seg
+            dsurf_seg = closest.norm(dim=-1) - _BAR_RADIUS
+            # 2026-09-30 (grasp-init acceptance): at the validated claw pose the
+            # index/middle TIP points sit ~2 cm off the bar surface (contact is
+            # mid-phalanx) and their centreline passes ~1.03 cm from it (finger
+            # half-thickness), so the tip-based prox kills the score (0.15).
+            # Optional `grasp_ovh_prox_mode` (default "tip" = unchanged):
+            #   "segment_prox": prox from the phalanx segment distance minus the
+            #       finger radius (grasp_ovh_finger_radius, index/middle/thumb),
+            #       slot/below/front indicators still at the tip;
+            #   "segment": prox AND indicators at the closest segment point.
+            radius = torch.tensor(
+                self.config.get("grasp_ovh_finger_radius", [0.010, 0.010, 0.003]),
+                device=self.device, dtype=torch.float32,
+            )[None, :]
+
+            def _score(d_eff, py, pz):
+                prox_ = torch.exp(-torch.square(d_eff.clamp(min=0.0) / sigma))
+                below_ = torch.sigmoid(-pz / k)
+                slot_ = torch.sigmoid((py - dy_min) / k) * torch.sigmoid((dy_max - py) / k)
+                front_ = torch.sigmoid((py - thumb_dy_min) / k)
+                sc = torch.where(is_thumb[None, :], front_, slot_) * below_ * prox_
+                hs = (1.0 - w) * sc.mean(dim=-1) + w * sc.min(dim=-1).values
+                return sc, hs, (slot_, below_, front_, prox_)
+
+            variants = {
+                "tip": _score(dsurf_tip, dy, dz),
+                "segment_prox": _score(dsurf_seg - radius, dy, dz),
+                "segment": _score(dsurf_seg - radius, closest[..., 0], closest[..., 1]),
+            }
+            mode = str(self.config.get("grasp_ovh_prox_mode", "tip"))
+            score, hand_score, (slot, below, thumb_front, prox) = variants[mode]
+            wrapped = (hand_score > min_score) & (dsurf_seg < max_dist).all(dim=-1)
+            out[side] = (score, dsurf_tip, dsurf_seg, hand_score, wrapped)
+            # 2026-09-30: sub-terms kept for _grasp_init_debug_report only.
+            self._ovh_last_sub[side] = (slot, below, thumb_front, prox, dy, dz)
+            self._ovh_last_tip[side] = tip  # (N, 3 fingers, xyz) bin frame rel. bar
+            self._ovh_last_variants[side] = {m: v[1] for m, v in variants.items()}
+        return out
+
+    def _overhand_link_idx(self, side):
+        """Simulator body indices of (index_1, middle_1, thumb_2) for a hand."""
+        if not hasattr(self, "_ovh_link_idx"):
+            sim_names = list(self.simulator.body_names)
+            self._ovh_link_idx = {
+                s: torch.tensor(
+                    [
+                        sim_names.index(f"{s}_hand_{f}_link")
+                        for f in ("index_1", "middle_1", "thumb_2")
+                    ],
+                    device=self.device, dtype=torch.long,
+                )
+                for s in ("left", "right")
+            }
+        return self._ovh_link_idx[side]
+
+    def _overhand_tip_offsets(self, side):
+        """(1,3,3) link-local fingertip points for (index_1, middle_1,
+        thumb_2). Index/middle = far point of the distal hull (same as
+        _wrap_tip_offsets); thumb = tip of the thumb_2 hull along its long
+        axis (left hull y in [-0.052, 0.007], right hull mirrored y in
+        [-0.007, 0.052], checked in g1_43dof_s3.usda 2026-09-29)."""
+        if not hasattr(self, "_ovh_tip_off"):
+            default = {
+                "left": [[0.0519, 0.0038, -0.0022], [0.0519, 0.0038, -0.0022], [0.0, -0.047, 0.0]],
+                "right": [[0.0519, -0.0038, 0.0022], [0.0519, -0.0038, 0.0022], [0.0, 0.047, 0.0]],
+            }
+            self._ovh_tip_off = {
+                s: torch.tensor(
+                    self.config.get(f"grasp_ovh_tip_offsets_{s}", default[s]),
+                    device=self.device, dtype=torch.float32,
+                )[None]
+                for s in ("left", "right")
+            }
+        return self._ovh_tip_off[side]
+
+    def _push_force_nomoment_raw(self):
+        """Hand force on the bin (N) projected on the line from the handle to
+        the wheel-ground contact (B4). A force along that line produces no
+        tipping moment about the wheel contact, so it rolls the tilted bin
+        instead of toppling it forward. Line = (mean wheel centre - wheel
+        radius * z) - bar midpoint when the wheel bodies are found on the bin
+        articulation, else a fixed push_force_line_angle_deg (60) below
+        horizontal along the push axis. Clamped to [0, push_force_nomoment_max]
+        (60 N)."""
+        forces = self.simulator.object_to_hand_contact_forces[:, 0, :, :].sum(dim=1)  # (N,3)
+        bar_mid = 0.5 * (self._left_bar_raw_pos() + self._right_bar_raw_pos())
+        direction = None
+        if not hasattr(self, "_bin_wheel_body_idx"):
+            self._bin_wheel_body_idx = None
+            try:
+                names = list(self.simulator.scene.articulations["bin"].body_names)
+                idx = [names.index(n) for n in ("wheel_left", "wheel_right")]
+                self._bin_wheel_body_idx = torch.tensor(idx, device=self.device)
+            except Exception as e:  # pragma: no cover - asset-dependent
+                logger.warning(f"push_force_nomoment: wheel bodies not found ({e}); fixed angle")
+        if self._bin_wheel_body_idx is not None:
+            wheel_pos = self.simulator.scene.articulations["bin"].data.body_pos_w[
+                :, self._bin_wheel_body_idx, :
+            ].mean(dim=1)
+            contact = wheel_pos.clone()
+            contact[:, 2] = contact[:, 2] - self.wheel_radius
+            direction = F.normalize(contact - bar_mid, dim=-1)
+        if direction is None:
+            ang = math.radians(float(self.config.get("push_force_line_angle_deg", 60.0)))
+            axis_xy = F.normalize(self.push_axis_world[:, :2], dim=-1)
+            direction = torch.cat(
+                [math.cos(ang) * axis_xy, torch.full_like(axis_xy[:, :1], -math.sin(ang))],
+                dim=-1,
+            )
+        max_f = float(self.config.get("push_force_nomoment_max", 60.0))
+        self._push_line_dir = direction  # for the push_force_line_deg log
+        return (forces * direction).sum(dim=-1).clamp(min=0.0, max=max_f)
 
     # ================================================================
     # RENDERING (eval video)
@@ -1814,17 +2867,27 @@ class BinPushHomie(
     def _stage_0_reward_condition(self):
         return torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
-    def _stage_0_to_1_advance_condition(self):
+    def _approach_transition_ready_mask(self):
         # Pelvis near the grasp-relative stop pose (XY), robot mostly stopped,
         # upper body near resting pose. Must match _reward_stop_at_bin's target so
         # the reward and the stage transition agree on WHERE to stop.
         cond = self._standoff_ready_mask()
+
+        # 2026-10-06 full3: optional yaw squaring-up gate (stop_transition_yaw_tolerance_deg,
+        # default None = off) so diagonal approaches from phi != 0 turn to face the bin
+        # handle bar before entering STAGE_REACH.
+        cond &= self._approach_yaw_ready_mask()
 
         # Require a genuine stop, not a cruise-through. Run 6 showed the robot
         # hovering the stop zone at ~0.27 m/s — just under the old 0.3 gate — so
         # it flickered into REACH without settling. Tightened to 0.2.
         root_vel = self.simulator.robot_root_states[:, 7:10].norm(dim=-1)
         cond &= root_vel < float(self.config.get("stage_advance_vel", 0.2))
+
+        ang_vel_max = self.config.get("stage_advance_ang_vel", None)
+        if ang_vel_max is not None:
+            yaw_rate = self.simulator.robot_root_states[:, 12].abs()
+            cond &= yaw_rate < float(ang_vel_max)
 
         if self.config.get("stage_advance_require_resting_arms", True):
             max_deviation = (
@@ -1838,6 +2901,24 @@ class BinPushHomie(
             )
             cond &= max_deviation < arm_tolerance
         return cond
+
+    def _stage_0_to_1_advance_condition(self):
+        hold_steps = int(self.config.get("approach_transition_hold_steps", 1))
+        cond = self._approach_transition_ready_mask()
+        if hold_steps > 1:
+            cond = cond & (self._approach_transition_ready_steps >= hold_steps)
+        return cond
+
+    def _stage_0_to_1_advance_callback(self, env_ids):
+        # 2026-10-06 full3: StagedTaskBase.save_stage_states records
+        # time_in_stage_buf = max_stage_time[0] into STAGE_REACH snapshots, and
+        # check_stage_progression does not zero time_in_stage_buf unless
+        # reset_stage_time_on_progression is True globally. Zeroing it here when
+        # approach_reset_stage_timer_on_advance is True prevents a larger
+        # max_stage_time[0] (e.g. 200 steps for 1.1 m walking) from giving
+        # downstream stages an unintended 200-step budget.
+        if bool(self.config.get("approach_reset_stage_timer_on_advance", False)):
+            self.time_in_stage_buf[env_ids] = 0
 
     def _stage_1_reward_condition(self):
         # BUGFIX (Run 7): previously this aliased _stage_0_to_1_advance_condition(),
@@ -1873,16 +2954,116 @@ class BinPushHomie(
         # Define push progress from the live bin pose at the moment the grasp is
         # validated. This also makes older staged snapshots, which predate the
         # tracked baseline buffer, safe to resume from.
+        # 2026-09-29 overhand: with the TILT stage the baseline is taken at
+        # TILT->PUSH instead (_stage_3_to_4_advance_callback), so the bin
+        # motion during tilting does not count as push progress.
+        if self._tilt_enabled:
+            return
         self._initial_bin_pos_xy[env_ids] = self.simulator.get_task_root_state("bin")[
             env_ids, :2
         ].clone()
+        self._initial_bar_pos_xy[env_ids] = self._bar_mid_xy()[env_ids]
 
     def _stage_3_reward_condition(self):
+        # 2026-09-29 overhand: stage 3 is TILT when enable_tilt_stage, else PUSH.
+        if self._tilt_enabled:
+            return self._grip_maintained_mask()
         return self._grasp_pose_valid_mask()
 
     def _stage_3_to_complete_condition(self):
+        # Old 4-stage layout only (enable_tilt_stage False); see
+        # _stage_4_to_complete_condition for the 5-stage layout.
         target = float(self.config.get("target_bin_push_distance", 1.0))
         return self._grasp_pose_valid_mask() & (self._bin_push_progress() > target)
+
+    # --- 2026-09-29 overhand: 5-stage layout (enable_tilt_stage) ---------
+    # 0 APPROACH, 1 REACH, 2 GRASP, 3 TILT, 4 PUSH. StagedTaskBase only looks
+    # these up when len(max_stage_time) == 5.
+    def _stage_3_to_4_advance_condition(self):
+        """TILT -> PUSH: back-tilt inside [tilt_advance_min_deg,
+        tilt_advance_max_deg] (10..22) held for tilt_advance_hold_steps (10)
+        consecutive steps with the grip maintained (_grip_maintained_mask).
+
+        2026-10-03 tilt7: with tilt_advance_max_rate_dps (default None) the
+        bin must also be steady -- |d tilt/dt| <= the episode's threshold on
+        every hold step (counter) and on the gate step itself."""
+        hold = int(self.config.get("tilt_advance_hold_steps", 10))
+        theta = self._bin_tilt_back_deg()
+        lo = float(self.config.get("tilt_advance_min_deg", 10.0))
+        hi = float(self.config.get("tilt_advance_max_deg", 22.0))
+        cond = (
+            (theta >= lo)
+            & (theta <= hi)
+            & self._grip_maintained_mask()
+            & (self._tilt_hold_steps >= hold)
+        )
+        if getattr(self, "_tilt_rate_gate", False):
+            cond = cond & (self._bin_tilt_rate_dps().abs() <= self._tilt_rate_thr_env)
+        return cond
+
+    def _stage_3_to_4_advance_callback(self, env_ids):
+        # Push-progress baseline = live bin pose when the tilted bin is handed
+        # over to PUSH (was the 2->3 callback in the 4-stage layout).
+        self._initial_bin_pos_xy[env_ids] = self.simulator.get_task_root_state("bin")[
+            env_ids, :2
+        ].clone()
+        self._initial_bar_pos_xy[env_ids] = self._bar_mid_xy()[env_ids]
+        # 2026-10-03 tilt7 (logging only): tilt rate / tilt at the handover
+        # (same physics state as the gate check), over the last
+        # tilt_gate_log_window handovers: mean signed rate, p90 of |rate|,
+        # mean tilt. tilt5 5100 / push1: ~+31 deg/s (p90 41-46) at ~15 deg.
+        if hasattr(self, "_gate_buf"):
+            rows = torch.stack(
+                [self._bin_tilt_rate_dps()[env_ids], self._bin_tilt_back_deg()[env_ids]],
+                dim=-1,
+            )[-self._gate_win:]
+            k = rows.shape[0]
+            idx = (torch.arange(k, device=self.device) + self._gate_ptr) % self._gate_win
+            self._gate_buf[idx] = rows
+            self._gate_ptr = (self._gate_ptr + k) % self._gate_win
+            self._gate_count = min(self._gate_count + k, self._gate_win)
+            b = self._gate_buf[: self._gate_count]
+            self.log_dict["tilt_gate_rate_dps"] = b[:, 0].mean()
+            self.log_dict["tilt_gate_rate_p90_dps"] = torch.quantile(b[:, 0].abs(), 0.9)
+            self.log_dict["tilt_gate_tilt_deg"] = b[:, 1].mean()
+
+    def _stage_4_reward_condition(self):
+        return self._grip_maintained_mask()
+
+    def _stage_4_to_complete_condition(self):
+        """PUSH complete: progress >= target_bin_push_distance AND back-tilt
+        in [push_complete_min_tilt_deg, push_complete_max_tilt_deg] (5..25)
+        AND grip maintained.
+
+        2026-09-29 overhand grasp_tilt: with `tilt_is_final` (default False)
+        reaching PUSH is itself the success -- i.e. the TILT->PUSH gate
+        (tilt 10..22 deg held tilt_advance_hold_steps with grip maintained)
+        passed. Combine with reset_on_complete: True so the episode ends as a
+        timeout (bootstrap) with the `complete` bonus."""
+        # 2026-10-06 approach_dr: `approach_is_final` (default False) --
+        # passing STAGE_APPROACH -> STAGE_REACH (held approach_transition_hold_steps
+        # inside the stop+yaw+velocity gate) is itself the episode completion.
+        if bool(self.config.get("approach_is_final", False)):
+            return self.stage_buf >= self.STAGE_REACH
+        if bool(self.config.get("tilt_is_final", False)):
+            return self.stage_buf == self.STAGE_PUSH
+        # 2026-09-30 overhand reach_grasp: `grasp_is_final` (default False)
+        # -- entering TILT (GRASP->TILT gate: overhand wrap + finger gate +
+        # palms within grasp_bar_valid_dist, held grasp_transition_hold_steps)
+        # is the success. Same mechanism as tilt_is_final.
+        if bool(self.config.get("grasp_is_final", False)):
+            return self.stage_buf >= self.STAGE_TILT
+        target = self._target_bin_push_distance_m()
+        theta = self._bin_tilt_back_deg()
+        lo = float(self.config.get("push_complete_min_tilt_deg", 5.0))
+        hi = float(self.config.get("push_complete_max_tilt_deg", 25.0))
+        return (
+            (self.stage_buf == self.STAGE_PUSH)  # base class does not stage-mask this
+            & self._grip_maintained_mask()
+            & (self._bin_push_progress() >= target)
+            & (theta >= lo)
+            & (theta <= hi)
+        )
 
     # ================================================================
     # REWARDS  (ported per-term from drawer_pull_homie, bimanual)
@@ -1920,18 +3101,25 @@ class BinPushHomie(
         # _reward_step_forward_while_pushing's existing root_vel[:, 2] = 0.0.
         root_vel = self.simulator.robot_root_states[:, 7:10].clone()
         root_vel[:, 2] = 0.0
-        target_vel = self.config.get("target_root_vel", 0.3) * target_dir
+        v_t = float(self.config.get("target_root_vel", 0.3))
+        target_vel = v_t * target_dir
+        std = float(self.config.get("walk_to_bin_vel_std", 0.15))
         vel_reward = self._tracking_reward_util(
             torch.linalg.norm(root_vel - target_vel, dim=-1),
-            std=0.15, target=0.0, scale=1.0, offset=0.0,
+            std=std, target=0.0, scale=1.0, offset=0.0,
         )
+        # 2026-10-06 full3: optional baseline subtraction so standing still
+        # (root_vel = 0) yields 0.0 instead of exp(-0.5 * (v_t / std)^2) = 0.135.
+        if bool(self.config.get("walk_to_bin_zero_at_rest", False)):
+            rest_val = math.exp(-0.5 * (v_t / std) ** 2)
+            vel_reward = ((vel_reward - rest_val) / max(1.0 - rest_val, 1e-6)).clamp(min=0.0)
         # Tight taper measured to the stop target (not bin center): full beyond
         # walk_taper_far, linearly to 0 at walk_taper_near.
         stop_xy = self._stop_target_xy()
         dist = (root_pos[:, :2] - stop_xy).norm(dim=-1)
         near = float(self.config.get("walk_taper_near", 0.4))
         far = float(self.config.get("walk_taper_far", 0.6))
-        taper = ((dist - near) / (far - near)).clamp(0.0, 1.0)
+        taper = ((dist - near) / max(far - near, 1e-6)).clamp(0.0, 1.0)
         return vel_reward * taper
 
     @StagedTaskBase.effective_in_stage(STAGE_APPROACH)
@@ -1978,6 +3166,33 @@ class BinPushHomie(
             root_vel, std=vel_std, target=0.0, scale=1.0, offset=0.0
         )
 
+        # 2026-10-06 full3: when stop_at_bin_include_yaw is True (default False),
+        # include a coarse + fine position gradient, a yaw squaring-up kernel
+        # gated on being near the stop target, and gate vel_reward by
+        # (along_reward * lat_reward * yaw_reward) so standing still far away
+        # earns zero stopping bonus.
+        if bool(self.config.get("stop_at_bin_include_yaw", False)):
+            coarse_std = float(self.config.get("stop_pos_coarse_std", 0.60))
+            along_coarse = self._tracking_reward_util(
+                along_dist, std=coarse_std, target=0.0, scale=1.0, offset=0.0
+            )
+            lat_coarse = self._tracking_reward_util(
+                lat_dist, std=coarse_std, target=0.0, scale=1.0, offset=0.0
+            )
+            yaw_std_rad = math.radians(float(self.config.get("stop_yaw_std_deg", 15.0)))
+            yaw_err = self._approach_yaw_error_rad().abs()
+            yaw_reward = self._tracking_reward_util(
+                yaw_err, std=yaw_std_rad, target=0.0, scale=1.0, offset=0.0
+            )
+            pos_gate = along_reward * lat_reward
+            pose_gate = pos_gate * yaw_reward
+            return (
+                0.25 * (0.4 * along_coarse + 0.6 * along_reward)
+                + 0.25 * (0.4 * lat_coarse + 0.6 * lat_reward)
+                + 0.25 * (pos_gate * yaw_reward)
+                + 0.25 * (pose_gate * vel_reward)
+            )
+
         mode = self.config.get("stop_reward_mode", "product")
         if mode == "product":
             return along_reward * lat_reward * vel_reward
@@ -1994,6 +3209,68 @@ class BinPushHomie(
                 + weights[2] * vel_reward
             )
         raise ValueError(f"Unknown stop_reward_mode: {mode}")
+
+    @StagedTaskBase.effective_in_stage(STAGE_APPROACH)
+    def _reward_approach_walk_command(self):
+        """2026-10-06 full3: guide physical_homie_commands[:, :3] ([vx, vy, vyaw]
+        in robot frame) during STAGE_APPROACH across HOMIE's 0.50 stand->walk
+        threshold when outside the stop+yaw gate, and toward [0, 0, 0] once
+        inside the stop+yaw gate so the robot settles into STAGE_REACH."""
+        cmd = self.get_physical_homie_commands()[:, :3]
+        root_xy = self.simulator.robot_root_states[:, :2]
+        stop_xy = self._stop_target_xy()
+        delta_w = stop_xy - root_xy
+        dist = delta_w.norm(dim=-1)
+        _, _, robot_yaw = euler_xyz_from_quat(
+            xyzw_to_wxyz(self.simulator.robot_root_states[:, 3:7])
+        )
+        c_yaw = torch.cos(robot_yaw)
+        s_yaw = torch.sin(robot_yaw)
+        # Rotate world XY error into robot body frame (+x forward, +y left)
+        dx_b = c_yaw * delta_w[:, 0] + s_yaw * delta_w[:, 1]
+        dy_b = -s_yaw * delta_w[:, 0] + c_yaw * delta_w[:, 1]
+        dir_b = F.normalize(torch.stack([dx_b, dy_b], dim=-1), dim=-1)
+
+        # Target yaw error to square up with -face_normal (so desired vyaw = -yaw_err)
+        yaw_err = self._approach_yaw_error_rad()
+        target_vyaw = (-2.0 * yaw_err).clamp(-0.65, 0.65)
+
+        # Speed scales down near stop_xy, but whenever outside the stop+yaw gate
+        # keep target command norm >= 0.58 so HOMIE switches from stand_model to
+        # walk_model (threshold in ppo_trainer_homie_api.py is 0.50).
+        in_gate = self._standoff_ready_mask() & self._approach_yaw_ready_mask()
+        lin_mag = (dist / 0.25).clamp(0.0, 1.0) * 0.55
+        target_vxy = dir_b * lin_mag.unsqueeze(-1)
+        target_cmd = torch.cat([target_vxy, target_vyaw.unsqueeze(-1)], dim=-1)
+        cmd_norm = target_cmd.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        boosted_cmd = torch.where(
+            cmd_norm < 0.58,
+            target_cmd * (0.58 / cmd_norm),
+            target_cmd,
+        )
+        # If both dist and yaw_err are tiny (<2 cm and <3 deg), fallback direction is +x
+        tiny = (dist < 0.02) & (yaw_err.abs() < math.radians(3.0))
+        fallback_cmd = torch.zeros_like(cmd)
+        fallback_cmd[:, 0] = 0.58
+        boosted_cmd = torch.where(tiny.unsqueeze(-1), fallback_cmd, boosted_cmd)
+
+        desired_cmd = torch.where(
+            in_gate.unsqueeze(-1),
+            torch.zeros_like(cmd),
+            boosted_cmd,
+        )
+        std = float(self.config.get("approach_walk_command_std", 0.25))
+        return self._tracking_reward_util(
+            torch.linalg.norm(cmd - desired_cmd, dim=-1),
+            std=std, target=0.0, scale=1.0, offset=0.0,
+        )
+
+    @StagedTaskBase.effective_in_stage(STAGE_APPROACH)
+    def _reward_approach_advance(self):
+        """2026-10-06 full3: one-time milestone bonus on the step the episode
+        passes the STAGE_APPROACH -> STAGE_REACH gate (mirrors grasp_advance
+        and tilt_advance)."""
+        return self._stage_0_to_1_advance_condition().float()
 
     @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
     def _reward_maintain_standoff(self):
@@ -2194,7 +3471,8 @@ class BinPushHomie(
             left_palm,
             self._left_handle_target(),
             self._left_hand_dof_idx,
-            self._left_p0,
+            # 2026-09-24: finger gate measured against the pre-shape pose.
+            self._finger_preshape_poses()[0],
             left_alignment,
         )
 
@@ -2208,20 +3486,24 @@ class BinPushHomie(
             right_palm,
             self._right_handle_target(),
             self._right_hand_dof_idx,
-            self._right_p0,
+            # 2026-09-24: finger gate measured against the pre-shape pose.
+            self._finger_preshape_poses()[1],
             right_alignment,
         )
 
     @StagedTaskBase.effective_in_stage([STAGE_APPROACH, STAGE_REACH])
     def _reward_reach_finger_dof_pos_l1(self):
         """Both hands OPEN (fingers near *_p0). Averaged L+R Gaussian on dof deviation."""
-        left_diff = self.simulator.dof_pos[:, self._left_hand_dof_idx] - self._left_p0
-        right_diff = self.simulator.dof_pos[:, self._right_hand_dof_idx] - self._right_p0
+        # 2026-09-24: target is the pre-shape pose (p0 when
+        # finger_preshape_frac=0) -- see _finger_preshape_poses.
+        left_pre, right_pre = self._finger_preshape_poses()
+        left_diff = self.simulator.dof_pos[:, self._left_hand_dof_idx] - left_pre
+        right_diff = self.simulator.dof_pos[:, self._right_hand_dof_idx] - right_pre
         left = self._tracking_reward_util(left_diff, std=0.3, target=0.0, scale=1.0, offset=0.0).mean(dim=-1)
         right = self._tracking_reward_util(right_diff, std=0.3, target=0.0, scale=1.0, offset=0.0).mean(dim=-1)
         return 0.5 * (left + right)
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_finger_dof_pos_l1(self):
         """Track a DISTANCE-GRADED finger target for both hands (open far
         from the bar, closed at it), gated by enable_pregrasp_curl -- falls
@@ -2260,18 +3542,31 @@ class BinPushHomie(
         def _one_hand_graded(hand_dof_idx, p0, p1, fraction):
             target = p0[None, :] + fraction[:, None] * (p1[None, :] - p0[None, :])
             diff = self.simulator.dof_pos[:, hand_dof_idx] - target
-            return self._tracking_reward_util(
+            # 2026-09-25: blend in the WORST joint so one finger jammed on the
+            # lid (seen in video: right middle / left index) costs reward.
+            per_joint = self._tracking_reward_util(
                 diff, std=0.3, target=0.0, scale=1.0, offset=0.0
-            ).mean(dim=-1)
+            )
+            w = float(self.config.get("grasp_finger_worst_weight", 0.0))
+            return (1.0 - w) * per_joint.mean(dim=-1) + w * per_joint.min(dim=-1).values
 
         def _one_hand_unconditional(hand_dof_idx, p1):
             diff = self.simulator.dof_pos[:, hand_dof_idx] - p1[None, :]
-            return self._tracking_reward_util(
+            # 2026-09-25: blend in the WORST joint so one finger jammed on the
+            # lid (seen in video: right middle / left index) costs reward.
+            per_joint = self._tracking_reward_util(
                 diff, std=0.3, target=0.0, scale=1.0, offset=0.0
-            ).mean(dim=-1)
+            )
+            w = float(self.config.get("grasp_finger_worst_weight", 0.0))
+            return (1.0 - w) * per_joint.mean(dim=-1) + w * per_joint.min(dim=-1).values
 
         if self.config.get("enable_pregrasp_curl", False):
             left_frac, right_frac = self._pregrasp_curl_fraction()
+            # 2026-09-24: never ask for LESS curl than the REACH pre-shape,
+            # so GRASP ramps pre-shape -> closed instead of re-opening first.
+            preshape = float(self.config.get("finger_preshape_frac", 0.0))
+            left_frac = left_frac.clamp(min=preshape)
+            right_frac = right_frac.clamp(min=preshape)
             left = _one_hand_graded(
                 self._left_hand_dof_idx, self._left_p0, self._left_p1, left_frac
             )
@@ -2283,9 +3578,16 @@ class BinPushHomie(
             # by default, preserved for fallback via enable_pregrasp_curl) ---
             left = _one_hand_unconditional(self._left_hand_dof_idx, self._left_p1)
             right = _one_hand_unconditional(self._right_hand_dof_idx, self._right_p1)
-        return 0.5 * (left + right)
+        # 2026-09-25 handlefix3: closure only pays when the fingertips are
+        # near the bar (mean tip prox, see _finger_wrap_scores). floor=1 = off.
+        floor = float(self.config.get("grasp_finger_near_gate_floor", 1.0))
+        if floor < 1.0:
+            (_, lp), (_, rp) = self._finger_wrap_scores()
+            left = left * (floor + (1.0 - floor) * lp.mean(dim=-1))
+            right = right * (floor + (1.0 - floor) * rp.mean(dim=-1))
+        return 0.5 * (left + right) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_target_distance(self):
         """Both palms close to their handle targets. Averaged L+R Gaussian."""
         lp, rp = self._palm_grasp_points()
@@ -2294,9 +3596,9 @@ class BinPushHomie(
         rd = torch.norm(ref_right - rp, dim=-1)
         left = self._tracking_reward_util(ld, std=0.1, target=0.0, scale=1.0, offset=0.0)
         right = self._tracking_reward_util(rd, std=0.1, target=0.0, scale=1.0, offset=0.0)
-        return 0.5 * (left + right)
+        return 0.5 * (left + right) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_target_anisotropic(self):
         """Axis-aware grasp-point shaping with a wider approach region.
 
@@ -2321,9 +3623,9 @@ class BinPushHomie(
             normalized_sq = (horiz / horiz_std) ** 2 + (vert / vert_std) ** 2
             return torch.exp(-0.5 * normalized_sq)
 
-        return 0.5 * (_one_hand(ld) + _one_hand(rd))
+        return 0.5 * (_one_hand(ld) + _one_hand(rd)) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_vert_progress(self):
         """Progress (potential-based) reward for REDUCING vertical
         palm-to-handle error step-over-step, mirroring
@@ -2361,7 +3663,7 @@ class BinPushHomie(
         self._prev_right_vert_error = right_vert_error.detach().clone()
         return 0.5 * (left_progress + right_progress)
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_bar_distance(self):
         """Dense pull toward the RAW bar position (not the offset hover
         target) -- new 2026-08-29.
@@ -2381,12 +3683,58 @@ class BinPushHomie(
         hover-target's own equilibrium distance. This term gives that
         missing pull, same isotropic-Gaussian shape as grasp_target_distance.
         """
-        left_dist, right_dist = self._hand_bar_distances()
+        # 2026-09-30: distance source selectable via grasp_bar_reward_target
+        # (default "bar" = the raw-bar distance used here before).
+        left_dist, right_dist = self._grasp_bar_reward_distances()
         left = self._tracking_reward_util(left_dist, std=0.1, target=0.0, scale=1.0, offset=0.0)
         right = self._tracking_reward_util(right_dist, std=0.1, target=0.0, scale=1.0, offset=0.0)
-        return 0.5 * (left + right)
+        return 0.5 * (left + right) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    def _grasp_bar_reward_distances(self):
+        """2026-09-30 (grasp_bar_reward_target): per-hand distance used by
+        _reward_grasp_bar_distance / _reward_grasp_bar_progress.
+
+        "bar" (default, old behaviour): `_hand_bar_distances()`, palm grasp
+        point -> RAW bar centre. Direction-blind: at reach_grasp1 step 2300
+        the left palm parked 4-5cm UNDER the bar and still scored ~5cm.
+        "grasp_target": palm grasp point -> `_grasp_point_targets()`, where
+        the grasp point sits when the palm LINK is at the handle target pose
+        (`_left/right_handle_target()` + target rotation). With the overhand
+        offsets that is 2.95 horiz / 3.35 vert = 4.46cm above/in front of the
+        bar. NOT the handle target itself: that is a palm-LINK pose 8.89cm
+        from the bar (standoff 0.072 / height 0.0521, measured
+        dist_*_hover_to_bar_s2), outside grasp_bar_valid_dist 0.07, so its
+        optimum could never validate. Its minimum is above the rim, so
+        pulling toward it from underneath drives the palm up into the rim
+        (and penalty_palm_below_bar makes staying there clearly worse).
+        """
+        mode = str(self.config.get("grasp_bar_reward_target", "bar"))
+        if mode == "bar":
+            return self._hand_bar_distances()
+        if mode == "grasp_target":
+            lp, rp = self._palm_grasp_points()
+            lt, rt = self._grasp_point_targets()
+            return torch.norm(lt - lp, dim=-1), torch.norm(rt - rp, dim=-1)
+        raise ValueError(
+            f"grasp_bar_reward_target must be 'bar' or 'grasp_target', got {mode!r}"
+        )
+
+    def _grasp_point_targets(self):
+        """2026-09-30: world position of each palm GRASP point when the palm
+        link is exactly at its handle target pose -- same construction as
+        `_palm_grasp_points` (link + R * offset * grasp_axis) but with the
+        target pose. See `_grasp_bar_reward_distances`."""
+        left_axis, right_axis = self._palm_grasp_axes()
+        offset = float(self.config.get("palm_grasp_point_offset", 0.0464))
+        left = self._left_handle_target() + quat_apply(
+            xyzw_to_wxyz(self._left_handle_target_rot()), offset * left_axis
+        )
+        right = self._right_handle_target() + quat_apply(
+            xyzw_to_wxyz(self._right_handle_target_rot()), offset * right_axis
+        )
+        return left, right
+
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_bar_progress(self):
         """Progress (potential-based) reward for REDUCING raw bar distance
         step-over-step -- new 2026-08-29, mirrors _reward_grasp_vert_progress
@@ -2397,9 +3745,18 @@ class BinPushHomie(
         Masks the first step of every episode, same as the other progress
         rewards in this file.
         """
-        left_dist, right_dist = self._hand_bar_distances()
+        # 2026-09-30: same selectable distance as _reward_grasp_bar_distance
+        # (grasp_bar_reward_target). The prev buffers always hold the distance
+        # of the CURRENT mode; if the mode ever differs from the one that
+        # filled them (first call, or a runtime config change) this step is
+        # masked for all envs and the buffers are refilled.
+        left_dist, right_dist = self._grasp_bar_reward_distances()
+        mode = str(self.config.get("grasp_bar_reward_target", "bar"))
         max_step_error = float(self.config.get("grasp_bar_progress_norm", 0.3))
         valid = (self.episode_length_buf > 1).float()
+        if getattr(self, "_prev_bar_dist_mode", mode) != mode:
+            valid = torch.zeros_like(valid)
+        self._prev_bar_dist_mode = mode
         left_progress = (
             (self._prev_left_bar_dist - left_dist) / max_step_error * valid
         )
@@ -2410,7 +3767,7 @@ class BinPushHomie(
         self._prev_right_bar_dist = right_dist.detach().clone()
         return 0.5 * (left_progress + right_progress)
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_fingertip_curl(self):
         """Reward genuine FINGERTIP contact, smoothly gated by proximity to
         the true bar -- new 2026-08-29, prepared (not yet deployed) after
@@ -2467,7 +3824,7 @@ class BinPushHomie(
         left_force_term = (left_tip_force / max_force).clamp(max=1.0)
         right_force_term = (right_tip_force / max_force).clamp(max=1.0)
 
-        return 0.5 * (left_near * left_force_term + right_near * right_force_term)
+        return 0.5 * (left_near * left_force_term + right_near * right_force_term) * self._grasp_shape_stage_scale()
 
     def _fingertip_forces(self):
         """Raw per-hand fingertip contact force magnitude (Newtons), summed
@@ -2499,7 +3856,7 @@ class BinPushHomie(
         right_tip_force = forces[:, self._right_fingertip_mask, :].norm(dim=-1).sum(dim=-1)
         return left_tip_force, right_tip_force
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_penalty_grasp_flat_press(self):
         """Penalize non-fingertip contact force, proximity-gated -- the
         logical complement of _reward_grasp_fingertip_curl above.
@@ -2550,6 +3907,8 @@ class BinPushHomie(
                 i for i, n in enumerate(g1_hand_links)
                 if "right_hand" in n and any(s in n for s in fingertip_substrings)
             ]
+        # 2026-09-28 handlefix5: in the front hook the palm SHOULD press the bar.
+        exclude_palm = bool(self.config.get("grasp_flat_press_exclude_palm", False))
         if not hasattr(self, "_left_flat_press_mask"):
             g1_hand_links = [
                 n for n in self.simulator.robot_config.body_names
@@ -2559,10 +3918,12 @@ class BinPushHomie(
             self._left_flat_press_mask = [
                 i for i, n in enumerate(g1_hand_links)
                 if "left_hand" in n and not any(s in n for s in fingertip_substrings)
+                and not (exclude_palm and "palm" in n)
             ]
             self._right_flat_press_mask = [
                 i for i, n in enumerate(g1_hand_links)
                 if "right_hand" in n and not any(s in n for s in fingertip_substrings)
+                and not (exclude_palm and "palm" in n)
             ]
         left_flat_force = forces[:, self._left_flat_press_mask, :].norm(dim=-1).sum(dim=-1)
         right_flat_force = forces[:, self._right_flat_press_mask, :].norm(dim=-1).sum(dim=-1)
@@ -2572,7 +3933,7 @@ class BinPushHomie(
 
         return 0.5 * (left_near * left_penalty_term + right_near * right_penalty_term)
 
-    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_grasp_contact(self):
         """Continuous, physics-grounded force reward -- replaces the prior
         geometry-gated version (see the commented block below for its full
@@ -2668,7 +4029,7 @@ class BinPushHomie(
         reward = 0.5 * (left_reward + right_reward)
 
         in_reach = self.stage_buf == self.STAGE_REACH
-        return torch.where(in_reach, -1.0 * torch.abs(reward), reward)
+        return torch.where(in_reach, -1.0 * torch.abs(reward), reward * self._grasp_shape_stage_scale())
 
         # --- Original geometry-gated version (superseded 2026-08-27) ---
         # left_count, right_count = self._hand_contact_counts()
@@ -2708,7 +4069,7 @@ class BinPushHomie(
         # both_valid = left_valid * right_valid
         # return 0.25 * (left_valid + right_valid) + 0.5 * both_valid
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_penalty_wrong_twist_contact(self):
         """Penalize hand-bin contact while twist is still badly wrong.
 
@@ -2732,7 +4093,7 @@ class BinPushHomie(
         right_wrong = right_contact & (right_twist > max_twist)
         return left_wrong.float() + right_wrong.float()
 
-    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_palm_down_alignment(self):
         """Align each mirrored palm's contact face with the bin's downward normal."""
         left_alignment, right_alignment = self._palm_down_alignments()
@@ -2742,11 +4103,12 @@ class BinPushHomie(
         # independent rotation signal.
         left_score = left_alignment.clamp(-1.0, 1.0)
         right_score = right_alignment.clamp(-1.0, 1.0)
-        return 0.25 * (left_score + right_score) + 0.5 * torch.minimum(
-            left_score, right_score
-        )
+        return (
+            0.25 * (left_score + right_score)
+            + 0.5 * torch.minimum(left_score, right_score)
+        ) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_palm_twist_alignment(self):
         """Reward matching the authored target's twist about the palm-down axis.
 
@@ -2776,9 +4138,9 @@ class BinPushHomie(
         right_score = self._tracking_reward_util(
             right_twist, std=twist_std, target=0.0, scale=1.0, offset=0.0
         )
-        return 0.5 * (left_score + right_score)
+        return 0.5 * (left_score + right_score) * self._grasp_shape_stage_scale()
 
-    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_palm_twist_progress(self):
         """Potential-based reward for REDUCING twist error step-over-step.
 
@@ -2806,7 +4168,7 @@ class BinPushHomie(
         self._prev_right_twist = right_twist.detach().clone()
         return 0.5 * (left_progress + right_progress)
 
-    @StagedTaskBase.effective_in_stage(STAGE_PUSH)
+    @_effective_in_named_stages("TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_maintain_grasp_while_pushing(self):
         """Reward sustained bimanual bar proximity during the push.
 
@@ -2817,13 +4179,46 @@ class BinPushHomie(
         """
         left_dist, right_dist = self._hand_bar_distances()
         bar_valid_dist = float(self.config.get("grasp_bar_valid_dist", 0.03))
-        left_reward = (1.0 - left_dist / bar_valid_dist).clamp(min=0.0, max=1.0)
-        right_reward = (1.0 - right_dist / bar_valid_dist).clamp(min=0.0, max=1.0)
+        if bool(self.config.get("push_grip_loose_check", False)):
+            # 2026-09-29 overhand (I3): loose version matching
+            # _grip_maintained_mask -- 1.0 inside the grasp gate
+            # (grasp_bar_valid_dist; the overhand target itself sits at
+            # ~4.5cm), linear to 0 at push_grip_max_bar_dist (8cm), times a
+            # closure ramp (p0->p1 axis) reaching 1 at push_grip_min_closure.
+            max_d = float(self.config.get("push_grip_max_bar_dist", 0.08))
+            min_c = float(self.config.get("push_grip_min_closure", 0.6))
+            push_max_d = float(self.config.get("push_stage_grip_max_bar_dist", max_d))
+            push_min_c = float(self.config.get("push_stage_grip_min_closure", min_c))
+            if push_max_d != max_d or push_min_c != min_c:
+                in_push = self.stage_buf == self.STAGE_PUSH
+                max_d = torch.where(
+                    in_push,
+                    torch.full_like(left_dist, push_max_d),
+                    torch.full_like(left_dist, max_d),
+                )
+                min_c = torch.where(
+                    in_push,
+                    torch.full_like(left_dist, push_min_c),
+                    torch.full_like(left_dist, min_c),
+                )
+                span = (max_d - bar_valid_dist).clamp(min=1e-3)
+            else:
+                span = max(max_d - bar_valid_dist, 1e-3)
+            lc, rc = self._finger_closure_fractions()
+            left_reward = ((max_d - left_dist) / span).clamp(0.0, 1.0) * (
+                lc / min_c
+            ).clamp(0.0, 1.0)
+            right_reward = ((max_d - right_dist) / span).clamp(0.0, 1.0) * (
+                rc / min_c
+            ).clamp(0.0, 1.0)
+        else:
+            left_reward = (1.0 - left_dist / bar_valid_dist).clamp(min=0.0, max=1.0)
+            right_reward = (1.0 - right_dist / bar_valid_dist).clamp(min=0.0, max=1.0)
         return 0.25 * (left_reward + right_reward) + 0.5 * (
             left_reward * right_reward
         )
 
-    @StagedTaskBase.effective_in_stage(STAGE_PUSH)
+    @_effective_in_named_stages("PUSH")
     def _reward_push_bin_progress(self):
         """Blend normalized forward velocity with monotonic displacement.
 
@@ -2844,19 +4239,34 @@ class BinPushHomie(
         axis = self.push_axis_world  # unit-ish (1,0,0) in v1
         axis_unit = F.normalize(axis, dim=-1)
         vel_along = (bin_vel * axis_unit).sum(dim=-1)          # m/s along push axis
+        if bool(self.config.get("push_progress_use_bar_min", False)):
+            # 2026-10-03 push2: tipping the bin back around the handle swings
+            # the bottom root forward (+0.5 m/s) while the handle moves back;
+            # require both root and handle bar to move forward.
+            vel_along = torch.minimum(vel_along, self._bar_fwd_vel())
         target_vel = float(self.config.get("push_target_vel", 0.30))
         vel_reward = (vel_along / target_vel).clamp(min=0.0, max=1.0)
 
         progress = self._bin_push_progress()                    # meters along axis
-        target = float(self.config.get("target_bin_push_distance", 1.0))
+        target = self._target_bin_push_distance_m()
         pos_reward = progress.clamp(min=0.0, max=target) / target
+        if bool(self.config.get("push_progress_require_positive_vel", False)):
+            # 2026-10-04 push6: only pay the static position fraction while the
+            # bin/bar is actively moving forward (vel_along > 0); a parked bin
+            # at e.g. +0.05 m earns 0.0 instead of farming pos_reward for 8+ s.
+            v_gate = max(float(self.config.get("push_progress_vel_gate_mps", 0.05)), 1e-3)
+            pos_reward = pos_reward * (vel_along / v_gate).clamp(0.0, 1.0)
         velocity_weight = float(self.config.get("push_velocity_weight", 0.50))
         reward = velocity_weight * vel_reward + (1.0 - velocity_weight) * pos_reward
+        # 2026-09-29 overhand (B4/I4): only pay progress with the bin tilted
+        # back inside the band (a forward topple also moves the bin root).
+        if bool(self.config.get("push_tilt_band_gate", False)):
+            reward = reward * self._tilt_band_weight()
         return reward
         # --- Original grasp-gated version (superseded 2026-08-29) ---
         # return reward * self._grasp_pose_valid_mask().float()
 
-    @StagedTaskBase.effective_in_stage(STAGE_PUSH)
+    @_effective_in_named_stages("TILT", "PUSH")
     def _reward_step_forward_while_pushing(self):
         """Reward pelvis velocity along pushAxisWorld (walking WITH the bin).
         Mirror of drawer step_backward_while_pulling with the sign flipped.
@@ -2868,14 +4278,52 @@ class BinPushHomie(
         root_vel[:, 2] = 0.0
         axis_unit = F.normalize(self.push_axis_world, dim=-1)
         fwd_vel = (root_vel * axis_unit).sum(dim=-1)
+        target_v = float(self.config.get("step_forward_target_vel", 0.20))
+        std_v = float(self.config.get("step_forward_vel_std", 0.15))
         reward = self._tracking_reward_util(
-            fwd_vel, std=0.15, target=0.2, scale=1.0, offset=0.0
+            fwd_vel, std=std_v, target=target_v, scale=1.0, offset=0.0
         )
+        if bool(self.config.get("step_forward_zero_at_rest", False)):
+            # 2026-10-04 push6: subtract the zero-velocity Gaussian baseline
+            # exp(-(target/std)^2) (~0.169) so standing still (fwd_vel <= 0)
+            # earns 0.0 instead of +0.169.
+            b0 = math.exp(-((target_v / max(std_v, 1e-3)) ** 2))
+            reward = ((reward - b0) / max(1.0 - b0, 1e-4)).clamp(0.0, 1.0)
+        # 2026-09-29 overhand (B4): walk only once the bin is tilted.
+        if bool(self.config.get("push_tilt_band_gate", False)):
+            reward = reward * self._tilt_band_weight()
+        if self._tilt_enabled:
+            in_push = (self.stage_buf == self.STAGE_PUSH).float()
+            if bool(self.config.get("tilt_walk_ramp_in_band", False)):
+                # 2026-10-03 push2: smooth walk ramp in TILT once the bin is in
+                # the tilt band and settling, bridging into PUSH.
+                in_tilt = (self.stage_buf == self.STAGE_TILT).float()
+                ramp_w = float(self.config.get("tilt_walk_ramp_scale", 0.5)) * self._tilt_steady_weight(
+                    float(self.config.get("tilt_walk_ramp_rate_std_dps", 25.0))
+                )
+                reward = reward * (in_push + in_tilt * ramp_w)
+            else:
+                reward = reward * in_push
+        stall_pen = float(self.config.get("step_forward_stall_penalty", 0.0))
+        if stall_pen > 0.0:
+            # 2026-10-04 push6: in STAGE_PUSH after the brief settle grace
+            # window (push_stall_grace_steps, default 25 = 0.5 s), explicitly
+            # penalize non-positive / sub-threshold forward velocity of the
+            # coupled robot+bin system (min(pelvis_fwd_vel, bar_fwd_vel) <
+            # step_forward_min_vel).
+            grace = float(self.config.get("push_stall_grace_steps", 25.0))
+            ramp = max(float(self.config.get("push_stall_ramp_steps", 15.0)), 1e-3)
+            alpha = ((self.time_in_stage_buf.float() - grace) / ramp).clamp(0.0, 1.0)
+            v_req = float(self.config.get("step_forward_min_vel", 0.05))
+            v_eff = torch.minimum(fwd_vel, self._bar_fwd_vel())
+            deficit = ((v_req - v_eff) / 0.10).clamp(0.0, 1.5)
+            in_push_mask = (self.stage_buf == self.STAGE_PUSH).float()
+            reward = reward - stall_pen * deficit * alpha * in_push_mask
         return reward
         # --- Original grasp-gated version (superseded 2026-08-29) ---
         # return reward * self._grasp_pose_valid_mask().float()
 
-    @StagedTaskBase.effective_in_stage(STAGE_PUSH)
+    @_effective_in_named_stages("PUSH")
     def _reward_push_bin_force(self):
         """Reward raw hand-to-bin contact force along the push direction,
         ungated by grasp validity or bin motion (stage mask only).
@@ -2909,13 +4357,539 @@ class BinPushHomie(
         max_force = float(self.config.get("push_force_reward_max", 20.0))
         return total_force.clamp(min=0.0, max=max_force)
 
+    @_effective_in_named_stages("PUSH")
+    def _reward_push_force_nomoment(self):
+        """2026-09-29 overhand (B4): replaces push_bin_force. Hand force on the
+        bin projected on the handle -> wheel-contact line (no tipping moment,
+        see _push_force_nomoment_raw), capped at push_force_nomoment_max
+        (60 N), times the tilt-band weight w_tilt (a flat bin tips forward at
+        ~44 N instead of rolling)."""
+        return self._push_force_nomoment_raw() * self._tilt_band_weight()
+
+    def _tilt_potential(self):
+        """Gaussian tilt potential shared by bin_tilt_back / bin_tilt_progress."""
+        t = float(self.config.get("bin_tilt_target_deg", 15.0))
+        std = float(self.config.get("bin_tilt_back_std_deg", 10.0))
+        return torch.exp(-torch.square((self._bin_tilt_back_deg() - t) / std))
+
+    @_effective_in_named_stages("TILT")
+    def _reward_bin_tilt_progress(self):
+        """2026-09-29 overhand: potential-based tilt shaping in TILT: step
+        change of the bin_tilt_back Gaussian, divided by
+        bin_tilt_progress_norm (0.05 -> a typical 15deg-in-1.5s tilt earns ~0.3
+        per step before the reward scale). First step of every episode masked
+        (stale previous value), same pattern as _reward_palm_twist_progress.
+        The previous potential is updated in every stage so the first TILT
+        step already sees a meaningful delta."""
+        pot = self._tilt_potential()
+        norm = float(self.config.get("bin_tilt_progress_norm", 0.05))
+        valid = (self.episode_length_buf > 1).float()
+        progress = (pot - self._prev_tilt_potential) / norm * valid
+        self._prev_tilt_potential = pot.detach().clone()
+        clip_deg = self.config.get("bin_tilt_progress_clip_deg", None)
+        if clip_deg is not None:
+            # 2026-10-03 push2: once inside the tilt band (>= clip_deg, e.g. 14),
+            # stop paying positive progress for accelerating further back while
+            # keeping the negative penalty if the bin overshoots past 15 deg.
+            progress = torch.where(
+                self._bin_tilt_back_deg() >= float(clip_deg),
+                progress.clamp(max=0.0),
+                progress,
+            )
+        return progress
+
+    # 2026-10-01 tilt2: force-based TILT shaping. tilt1 grasped (86 % reach
+    # TILT, grip kept 82-92 %) but the bin never rotated (tilt_back_max <=
+    # 0.09 deg): bin_tilt_back / bin_tilt_progress are outcome-only and the
+    # wheeled bin needs a finite moment about its wheel-ground contact line
+    # before it rotates at all, so there was no gradient below that moment.
+    # +1: object_to_hand_contact_forces reads as the force ON THE BIN from each
+    # hand link (tilt_feasibility A2, canned grasp: hands resting on the bar ->
+    # F_z < 0, hands pulled down -> more negative, pulled back-and-up -> F_z
+    # >= 0; hands pulled toward the robot -> F . push_axis < 0).
+    BIN_TILT_MOMENT_FORCE_SIGN = 1.0
+    # Default bin_tilt_moment_ref_Nm = measured tilt onset (tilt_feasibility
+    # A1, external force at the bar midpoint on the 17 kg bin): 29.9-33.4 Nm
+    # for horizontal / 30 deg-down pulls (the bin also slides/rolls toward the
+    # puller), 28.4 Nm at 60 deg, 22.8 Nm straight down; static analytic
+    # m*g*(COM 12.1 cm ahead of the wheel contact line) = 20.2 Nm.
+    BIN_TILT_MOMENT_REF_NM = 30.0
+
+    def _bin_wheel_contact_point(self):
+        """(N,3) wheel-ground contact point = mean wheel-body centre - wheel
+        radius * z (same construction as _push_force_nomoment_raw, sharing its
+        lazy wheel-body lookup), or None when the wheel bodies are missing."""
+        if not hasattr(self, "_bin_wheel_body_idx"):
+            self._bin_wheel_body_idx = None
+            try:
+                names = list(self.simulator.scene.articulations["bin"].body_names)
+                idx = [names.index(n) for n in ("wheel_left", "wheel_right")]
+                self._bin_wheel_body_idx = torch.tensor(idx, device=self.device)
+            except Exception as e:  # pragma: no cover - asset-dependent
+                logger.warning(f"bin wheel bodies not found ({e})")
+        if self._bin_wheel_body_idx is None:
+            return None
+        wheel_pos = self.simulator.scene.articulations["bin"].data.body_pos_w[
+            :, self._bin_wheel_body_idx, :
+        ].mean(dim=1)
+        contact = wheel_pos.clone()
+        contact[:, 2] = contact[:, 2] - self.wheel_radius
+        return contact
+
+    def _bin_tilt_moment_terms(self):
+        """2026-10-01 tilt2: (M, |F|), each (N,).
+
+        M (Nm) = hand-on-bin moment about the wheel-ground contact line,
+        + = tips the top back toward the robot (same sign as
+        _bin_tilt_back_deg):  M = sum_hands ((p_hand - c) x F_hand) . k,
+        c = _bin_wheel_contact_point(), k = a x z, a = horizontal push axis
+        (away from the robot). F_hand = BIN_TILT_MOMENT_FORCE_SIGN * sum of the
+        hand's links in object_to_hand_contact_forces (sign verified offline
+        with tilt_feasibility A1/A2: hands pulled toward the robot -> M > 0
+        and the bin tilts back). Contact point p_hand
+        (bin_tilt_moment_point): "bar" (default) = that hand's bar target
+        point (_left/_right_bar_raw_pos); robust -- the distal-link origins
+        sit 3-5 cm behind/above the bar while the tips are in the slot, and
+        the force is transmitted through the bar either way. "link" = each
+        link's origin (per-link force).
+        |F| = total hand-on-bin force magnitude (sum over links).
+
+        2026-10-01 tilt3: force_matrix_w (object_to_hand_contact_forces) is
+        the NORMAL contact force only. With bin_tilt_moment_friction (default
+        False) the friction part of the same contacts (_hand_friction_forces;
+        needs task.target_obj_contact_track_friction) is added per link before
+        the moment / |F|. Evidence: tilt3 offline test, tilt2 iter-2300
+        policy on a 6 kg bin (A1m5-scaled onset ~10-14 Nm): normal-only M >
+        10 Nm on 38 % of TILT steps, runs of up to 28 straight steps, and the
+        bin never moved (max +0.03 deg off rest) -- a squeezing claw reads as
+        a large + M while friction cancels it."""
+        self._init_hand_link_indices()
+        forces = self.BIN_TILT_MOMENT_FORCE_SIGN * self.simulator.object_to_hand_contact_forces[
+            :, 0, :, :
+        ]
+        if bool(self.config.get("bin_tilt_moment_friction", False)):
+            fr = self._hand_friction_forces()
+            if fr is not None:
+                forces = forces + fr
+        fmag = forces.norm(dim=-1).sum(dim=-1)
+        return self._bin_hand_moment(forces), fmag
+
+    def _hand_friction_forces(self):
+        """2026-10-01 tilt3: (N, L, 3) friction force ON THE BIN from each
+        hand link, same link order as object_to_hand_contact_forces:
+        bin_tilt_moment_friction_sign (default +1, i.e. the same convention
+        as force_matrix_w; checked offline against the bin's static moment
+        limit) * simulator.object_to_hand_friction_forces. None (warned once)
+        when task.target_obj_contact_track_friction is off."""
+        fr = getattr(self.simulator, "object_to_hand_friction_forces", None)
+        if fr is None:
+            if not getattr(self, "_warned_no_hand_friction", False):
+                logger.warning(
+                    "hand friction forces requested but task.target_obj_contact_track_friction "
+                    "is off -- using normal contact forces only"
+                )
+                self._warned_no_hand_friction = True
+            return None
+        return float(self.config.get("bin_tilt_moment_friction_sign", 1.0)) * fr[:, 0, :, :]
+
+    def _bin_hand_moment(self, forces):
+        """(N,) moment (Nm, + tips back) about the wheel contact line of
+        per-hand-link forces ON THE BIN, forces (N, L, 3) in the
+        object_to_hand_contact_forces link order; contact point per
+        bin_tilt_moment_point (see _bin_tilt_moment_terms). Zeros when the
+        wheel bodies are missing."""
+        self._init_hand_link_indices()
+        c = self._bin_wheel_contact_point()
+        if c is None:
+            return torch.zeros(forces.shape[0], device=forces.device, dtype=forces.dtype)
+        axis = F.normalize(self.push_axis_world[:, :2].float(), dim=-1)
+        a = torch.cat([axis, torch.zeros_like(axis[:, :1])], dim=-1)
+        z = torch.zeros_like(a)
+        z[:, 2] = 1.0
+        k = torch.cross(a, z, dim=-1)
+        mode = str(self.config.get("bin_tilt_moment_point", "bar"))
+        m = torch.zeros(forces.shape[0], device=forces.device, dtype=forces.dtype)
+        for side, bar in (
+            ("left", self._left_bar_raw_pos()),
+            ("right", self._right_bar_raw_pos()),
+        ):
+            f_h = forces[:, self._hand_link_contact_idx[side], :]  # (N,K,3)
+            if mode == "link":
+                p = self.simulator._rigid_body_pos[:, self._hand_link_sim_idx[side], :]
+                r = p - c[:, None, :]
+                m = m + (torch.cross(r, f_h, dim=-1) * k[:, None, :]).sum(dim=-1).sum(dim=-1)
+            else:
+                m = m + (torch.cross(bar - c, f_h.sum(dim=1), dim=-1) * k).sum(dim=-1)
+        return m
+
+    def _wrist_bin_contact_terms(self):
+        """2026-10-01 tilt3 diagnostic: (|F| N, M Nm) of the wrist links'
+        net contact force (robot-wide sensor, NORMAL only, unfiltered -- in
+        TILT the wrists only touch the bin), M = moment of the force ON THE BIN
+        (= -force on the link) about the wheel contact line at the link
+        origins, + tips back. Wrists are in neither the hand filter list nor
+        _body_bin_contact_force."""
+        if not hasattr(self, "_wrist_contact_idx"):
+            names = list(self.simulator.body_names)
+            self._wrist_contact_idx = torch.tensor(
+                [i for i, n in enumerate(names) if "wrist" in n],
+                device=self.device, dtype=torch.long,
+            )
+        f_link = self.simulator.contact_forces[:, self._wrist_contact_idx, :]
+        fmag = f_link.norm(dim=-1).sum(-1)
+        c = self._bin_wheel_contact_point()
+        if c is None:
+            return fmag, torch.zeros_like(fmag)
+        axis = F.normalize(self.push_axis_world[:, :2].float(), dim=-1)
+        a = torch.cat([axis, torch.zeros_like(axis[:, :1])], dim=-1)
+        z = torch.zeros_like(a)
+        z[:, 2] = 1.0
+        k = torch.cross(a, z, dim=-1)
+        r = self.simulator._rigid_body_pos[:, self._wrist_contact_idx, :] - c[:, None, :]
+        m = (torch.cross(r, -f_link, dim=-1) * k[:, None, :]).sum(dim=-1).sum(dim=-1)
+        return fmag, m
+
+    @_effective_in_named_stages("TILT", "PUSH")
+    def _reward_bin_tilt_moment(self):
+        """2026-10-01 tilt2: clamp(M / bin_tilt_moment_ref_Nm, 0, 1) * grip,
+        M from _bin_tilt_moment_terms (hand moment about the wheel contact
+        line, + = tips back), ref = measured tilt-onset moment (A1), grip =
+        _grip_maintained_mask (the grip_maintained_frac_tilt mask) so shoving
+        the lid / pulling without holding does not pay. TILT only (unless
+        bin_tilt_moment_brake_in_push is enabled). Gives the
+        gradient toward "pull back harder" that the outcome-only tilt rewards
+        lack below the rotation threshold. Scale key `bin_tilt_moment`
+        (absent = off).
+
+        2026-10-02 grasp_tilt3: the lower clamp is `bin_tilt_moment_min_ratio`
+        (default 0.0 = the tilt2/tilt3 behaviour above)."""
+        m, _ = self._bin_tilt_moment_terms()
+        ref = float(self.config.get("bin_tilt_moment_ref_Nm", self.BIN_TILT_MOMENT_REF_NM))
+        # 2026-10-02 grasp_tilt3: optional SIGNED moment. tilt3 (friction-
+        # corrected M) kept a 100 % grip at ~82 N hand force but M ~ -1.8 Nm,
+        # i.e. the hands pushed the bin toward tipping FORWARD; with the lower
+        # clamp at 0 a negative M cost nothing and gave no gradient toward
+        # pulling back. bin_tilt_moment_min_ratio < 0 (e.g. -1) makes the term
+        # linear through zero down to that ratio; values > 0 are treated as 0.
+        lo = min(float(self.config.get("bin_tilt_moment_min_ratio", 0.0)), 0.0)
+        grip = self._grip_maintained_mask().float()
+        r = (m / max(ref, 1e-3)).clamp(lo, 1.0) * grip
+        # 2026-10-01 tilt2 topple guard (tilt_feasibility A7: a steep push tips
+        # the bin past its ~23 deg balance point and it falls onto the robot):
+        # with bin_tilt_moment_off_deg set, the reward fades linearly to 0 over
+        # the last bin_tilt_moment_off_ramp_deg before that tilt. Holding 11-15
+        # deg needs only ~7-10 Nm, which bin_tilt_back pays for. Unset = old
+        # behaviour (no fade).
+        theta = self._bin_tilt_back_deg()
+        off = self.config.get("bin_tilt_moment_off_deg", None)
+        if off is not None:
+            ramp = max(float(self.config.get("bin_tilt_moment_off_ramp_deg", 4.0)), 1e-3)
+            r = r * ((float(off) - theta) / ramp).clamp(0.0, 1.0)
+        stall_steps = self.config.get("bin_tilt_moment_stall_decay_steps", None)
+        if stall_steps is not None:
+            # 2026-10-03 push4/push5: pulling below the gate band (theta <
+            # bin_tilt_moment_stall_min_deg) only pays during the initial pull
+            # initiation window (stall_steps). If the bin is still below
+            # min_deg, linearly decay positive moment reward to 0 over
+            # stall_span_steps so the policy cannot farm moment by holding below
+            # the gate band. Negative M keeps its penalty unchanged.
+            span = max(float(self.config.get("bin_tilt_moment_stall_span_steps", 35.0)), 1e-3)
+            min_deg = float(self.config.get("bin_tilt_moment_stall_min_deg", 2.0))
+            decay = (
+                1.0 - (self.time_in_stage_buf.float() - float(stall_steps)) / span
+            ).clamp(0.0, 1.0)
+            stalled = theta < min_deg
+            r = torch.where(stalled & (r > 0.0), r * decay, r)
+        if bool(self.config.get("bin_tilt_moment_brake_in_push", False)):
+            # 2026-10-03 push5: in delta-action space, the arm targets are wound
+            # up pulling backward (~130 N, +10..15 Nm) at TILT->PUSH handover.
+            # Penalize excess backward pull M > m_allow once tilted (>= 11 deg)
+            # and rotating backward (rate > 2 deg/s) or overshooting (> 14 deg)
+            # so the policy unwinds the backward arm yank on entering the band.
+            rate = self._bin_tilt_rate_dps()
+            brake_deg = float(self.config.get("bin_tilt_moment_brake_start_deg", 11.0))
+            w_ang = ((theta - brake_deg) / 3.0).clamp(0.0, 1.0)
+            w_rate = (
+                ((rate - 2.0) / 13.0).clamp(0.0, 1.0)
+                * ((theta - 8.0) / 3.0).clamp(0.0, 1.0)
+            )
+            m_steady = float(self.config.get("bin_tilt_moment_steady_hold_Nm", 7.0))
+            m_allow = (
+                m_steady
+                * (1.0 - w_rate)
+                * ((18.0 - theta) / 4.5).clamp(0.0, 1.0)
+            )
+            over_pull = (
+                ((m - m_allow) / 15.0).clamp(0.0, 1.0)
+                * torch.maximum(w_ang, w_rate)
+                * grip
+            )
+            r = torch.where(
+                self.stage_buf == self.STAGE_PUSH, -over_pull, r - over_pull
+            )
+        else:
+            r = torch.where(
+                self.stage_buf == self.STAGE_PUSH, torch.zeros_like(r), r
+            )
+        return r
+
+    def _body_bin_contact_force(self):
+        """2026-10-01 tilt2: summed net contact force (N) on robot links other
+        than hands / wrists / feet (name filter body_bin_contact_exclude). From
+        the robot-wide net contact sensor (simulator.contact_forces), so it is
+        not filtered to the bin, but in TILT/PUSH these links only touch the bin
+        (tilt_feasibility A6/A8: a pure hold logs ~0 N; a chest brace on the
+        handle/lid 150-290 N on torso_link)."""
+        if not hasattr(self, "_body_contact_idx"):
+            excl = list(self.config.get(
+                "body_bin_contact_exclude", ["hand", "wrist", "ankle", "foot", "toe"]))
+            names = list(self.simulator.body_names)
+            self._body_contact_idx = torch.tensor(
+                [i for i, n in enumerate(names) if not any(x in n for x in excl)],
+                device=self.device, dtype=torch.long,
+            )
+        return self.simulator.contact_forces[:, self._body_contact_idx, :].norm(dim=-1).sum(-1)
+
+    @_effective_in_named_stages("TILT", "PUSH")
+    def _reward_penalty_body_bin_contact(self):
+        """2026-10-01 tilt2: discourage tipping / pushing the bin with the
+        body (chest brace on the handle). Positive magnitude
+        clamp((F - deadband) / scale, 0, max) with F = _body_bin_contact_force
+        (deadband 10 N, scale 100 N, max 3), times a per-stage multiplier:
+        body_bin_contact_tilt_scale in TILT (small: a brace is tolerated while
+        tipping if it is the only way) and body_bin_contact_push_scale in PUSH
+        (ramped up: the bin must be pushed with the hands, in front of the
+        torso). Use a NEGATIVE reward scale `penalty_body_bin_contact` (absent
+        = off)."""
+        f = self._body_bin_contact_force()
+        dead = float(self.config.get("body_bin_contact_deadband_N", 10.0))
+        sc = max(float(self.config.get("body_bin_contact_scale_N", 100.0)), 1e-3)
+        mx = float(self.config.get("body_bin_contact_max", 3.0))
+        mag = ((f - dead) / sc).clamp(0.0, mx)
+        mult = torch.where(
+            self._named_stage_mask(("PUSH",)),
+            torch.full_like(mag, float(self.config.get("body_bin_contact_push_scale", 1.0))),
+            torch.full_like(mag, float(self.config.get("body_bin_contact_tilt_scale", 1.0))),
+        )
+        return mag * mult
+
+    def _dof_idx(self, names):
+        return torch.tensor(
+            [self.simulator.dof_names.index(n) for n in names],
+            device=self.device, dtype=torch.long,
+        )
+
+    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
+    def _reward_torso_lean(self):
+        """2026-09-28 handlefix5b: lean forward (waist pitch ~0.45 rad) so the
+        LEFT arm can reach the hook (IK: unreachable upright, exact at ~30 deg)."""
+        if not hasattr(self, "_waist_pitch_idx"):
+            self._waist_pitch_idx = self.simulator.dof_names.index("waist_pitch_joint")
+        q = self.simulator.dof_pos[:, self._waist_pitch_idx]
+        tgt = float(self.config.get("torso_lean_target", 0.45))
+        std = float(self.config.get("torso_lean_std", 0.2))
+        return torch.exp(-torch.square((q - tgt) / std))
+
+    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
+    def _reward_left_arm_posture(self):
+        """2026-09-28 handlefix5b: pull the LEFT arm toward the IK 'good branch'
+        for the hook (shoulder_yaw +, wrist_roll ~0) and out of the twisted
+        shoulder_yaw -150 / wrist_roll +112 pose it gets stuck in."""
+        if not hasattr(self, "_left_arm_idx"):
+            self._left_arm_idx = self._dof_idx([
+                f"left_{j}_joint" for j in (
+                    "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+                    "wrist_roll", "wrist_pitch", "wrist_yaw")
+            ])
+            self._left_arm_ref = torch.tensor(
+                self.config.get("left_arm_ref_pose",
+                                [-1.967, -0.077, 1.761, 0.930, 0.0, 0.162, 1.194]),
+                device=self.device, dtype=torch.float32,
+            )
+        std = float(self.config.get("left_arm_ref_std", 0.6))
+        err = self.simulator.dof_pos[:, self._left_arm_idx] - self._left_arm_ref[None]
+        return torch.exp(-torch.square(err / std).mean(dim=-1))
+
+    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
+    def _reward_penalty_left_wrist_roll(self):
+        """2026-09-28 handlefix5b: penalize the twisted left-forearm branch."""
+        if not hasattr(self, "_left_wrist_roll_idx"):
+            self._left_wrist_roll_idx = self.simulator.dof_names.index("left_wrist_roll_joint")
+        lim = float(self.config.get("left_wrist_roll_soft_limit", 1.3))
+        q = self.simulator.dof_pos[:, self._left_wrist_roll_idx]
+        return (q.abs() - lim).clamp(min=0.0)
+
+    def _arm_branch_q(self):
+        if not hasattr(self, "_arm_branch_idx"):
+            self._arm_branch_idx = self._dof_idx([
+                "left_shoulder_yaw_joint", "left_wrist_roll_joint",
+                "right_shoulder_yaw_joint", "right_wrist_roll_joint",
+            ])
+        return self.simulator.dof_pos[:, self._arm_branch_idx]
+
+    def _overhand_arm_wrist_q(self):
+        if not hasattr(self, "_ovh_arm_wrist_idx"):
+            self._ovh_arm_wrist_idx = self._dof_idx([
+                "left_shoulder_yaw_joint",
+                "left_wrist_roll_joint",
+                "left_wrist_pitch_joint",
+                "left_wrist_yaw_joint",
+                "right_shoulder_yaw_joint",
+                "right_wrist_roll_joint",
+                "right_wrist_pitch_joint",
+                "right_wrist_yaw_joint",
+            ])
+        return self.simulator.dof_pos[:, self._ovh_arm_wrist_idx]
+
+    @_effective_in_named_stages("APPROACH", "REACH", "GRASP", "TILT", "PUSH")
+    def _reward_penalty_arm_branch_guard(self):
+        """2026-09-28 handlefix5e: keep each arm on the IK branch that reaches the
+        hook (left shoulder_yaw >= 0, right <= 0, |wrist_roll| small). One-sided:
+        0 at the resting pose, so it does not fight the APPROACH arms-down term.
+
+        2026-10-04 full2 (arm_branch_overhand_mode, default False): in overhand
+        claw mode, the natural branch has left_shoulder_yaw in [-1.15, +0.10],
+        right_shoulder_yaw in [-0.80, +0.35], left_wrist_roll in [+0.25, +1.65],
+        right_wrist_roll in [-1.65, -0.25], |wrist_pitch| <= 0.95, and
+        |wrist_yaw| <= 0.85 (0.0 penalty at resting_dof_pos, overhand_th10_a080,
+        and reach_grasp2 1700, while penalizing chicken-wing shoulder_yaw and
+        pinned +-92.5 deg wrist pitch/yaw joint stops across all 5 stages)."""
+        if bool(self.config.get("arm_branch_overhand_mode", False)):
+            q = self._overhand_arm_wrist_q()
+            lsy, lwr, lwp, lwy, rsy, rwr, rwp, rwy = q.unbind(dim=-1)
+            lsy_lo = float(self.config.get("arm_branch_left_syaw_min", -1.15))
+            lsy_hi = float(self.config.get("arm_branch_left_syaw_max", 0.10))
+            rsy_lo = float(self.config.get("arm_branch_right_syaw_min", -0.80))
+            rsy_hi = float(self.config.get("arm_branch_right_syaw_max", 0.35))
+            lwr_lo = float(self.config.get("arm_branch_left_wroll_min", 0.25))
+            lwr_hi = float(self.config.get("arm_branch_left_wroll_max", 1.65))
+            rwr_lo = float(self.config.get("arm_branch_right_wroll_min", -1.65))
+            rwr_hi = float(self.config.get("arm_branch_right_wroll_max", -0.25))
+            wp_lim = float(self.config.get("arm_branch_wpitch_limit", 0.95))
+            wy_lim = float(self.config.get("arm_branch_wyaw_limit", 0.85))
+            left = (
+                (lsy_lo - lsy).clamp(min=0.0)
+                + (lsy - lsy_hi).clamp(min=0.0)
+                + (lwr_lo - lwr).clamp(min=0.0)
+                + (lwr - lwr_hi).clamp(min=0.0)
+                + (lwp.abs() - wp_lim).clamp(min=0.0)
+                + (lwy.abs() - wy_lim).clamp(min=0.0)
+            )
+            right = (
+                (rsy_lo - rsy).clamp(min=0.0)
+                + (rsy - rsy_hi).clamp(min=0.0)
+                + (rwr_lo - rwr).clamp(min=0.0)
+                + (rwr - rwr_hi).clamp(min=0.0)
+                + (rwp.abs() - wp_lim).clamp(min=0.0)
+                + (rwy.abs() - wy_lim).clamp(min=0.0)
+            )
+            rw = float(self.config.get("arm_branch_right_weight", 1.0))
+            out = left + rw * right
+            if bool(self.config.get("arm_branch_skip_in_approach", True)):
+                out = out * (self.stage_buf != self.STAGE_APPROACH).float()
+            return out
+        q = self._arm_branch_q()
+        m = float(self.config.get("arm_branch_shoulder_yaw_margin", 0.0))
+        wr = float(self.config.get("arm_branch_wrist_roll_limit", 0.5))
+        rw = float(self.config.get("arm_branch_right_weight", 1.0))
+        left = (-q[:, 0] - m).clamp(min=0.0) + (q[:, 1].abs() - wr).clamp(min=0.0)
+        right = (q[:, 2] - m).clamp(min=0.0) + (q[:, 3].abs() - wr).clamp(min=0.0)
+        pre_hold = (self.stage_buf <= self.STAGE_GRASP).float()
+        return (left + rw * right) * pre_hold
+
+    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
+    def _reward_penalty_left_arm_posture_l1(self):
+        """2026-09-28 handlefix5e: L1 pull of the 7 left-arm joints to the IK
+        good-branch pose (constant gradient at any distance)."""
+        if not hasattr(self, "_left_arm_idx"):
+            self._left_arm_idx = self._dof_idx([
+                f"left_{j}_joint" for j in (
+                    "shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow",
+                    "wrist_roll", "wrist_pitch", "wrist_yaw")
+            ])
+            self._left_arm_ref = torch.tensor(
+                self.config.get("left_arm_ref_pose",
+                                [-1.967, -0.077, 1.761, 0.930, 0.0, 0.162, 1.194]),
+                device=self.device, dtype=torch.float32,
+            )
+        err = self.simulator.dof_pos[:, self._left_arm_idx] - self._left_arm_ref[None]
+        return err.abs().mean(dim=-1)
+
+    @_effective_in_named_stages("TILT", "PUSH")
+    def _reward_push_forward_command(self):
+        """2026-09-28 handlefix5: HOMIE switches to the STAND model when
+        |cmd[:3]| < 0.1 (homie_base obs deadband), and GRASP trains the policy
+        to output 0 -- so in PUSH it never walks. Reward a forward command above
+        the deadband (linear push_cmd_deadband -> push_cmd_target), weighted up
+        when the bin is tipped back (force study: flat bin tips forward over its
+        base instead of rolling; tipped back 10-20 deg it rolls with any force)."""
+        vx = self.get_physical_homie_commands()[:, 0]
+        db = float(self.config.get("push_cmd_deadband", 0.1))
+        tgt = float(
+            self.config.get(
+                "push_cmd_target", self.config.get("push_cmd_target_vx", 0.3)
+            )
+        )
+        pre_w = float(self.config.get("push_cmd_pre_deadband_weight", 0.0))
+        if pre_w > 0.0 and db > 1e-4:
+            # 2026-10-03 push4 / 2026-10-04 push6: vx = get_physical_homie_commands()[:, 0]
+            # is 2.0 * _homie_commands[:, 0], and ppo_trainer_homie_api.py only
+            # switches from homie_stand_model to homie_walk_model when
+            # ||cmd[:3]|| > homie_switch_threshold = 0.50 (NOT 0.10).
+            # A linear pre-ramp (0 -> pre_w over [0, db], then pre_w -> 1.0 over
+            # [db, tgt]) gives immediate positive gradient from vx = 0.0 (and
+            # from tilt_push5's +0.27) across the true 0.50 walk-switch threshold.
+            pre_r = (vx / db).clamp(0.0, 1.0) * pre_w
+            post_r = ((vx - db) / max(tgt - db, 1e-3)).clamp(0.0, 1.0) * (1.0 - pre_w)
+            r = pre_r + post_r
+        else:
+            r = ((vx - db) / max(tgt - db, 1e-3)).clamp(0.0, 1.0)
+        floor = float(self.config.get("push_cmd_tilt_floor", 0.25))
+        tilt_w = (self._bin_tilt_back_deg() / 10.0).clamp(0.0, 1.0)
+        if bool(self.config.get("push_tilt_band_gate", False)):
+            # 2026-09-29 overhand (B4): band weight (0 flat, 1 in 10..22 deg,
+            # 0 past 25 deg) instead of the one-sided ramp; with
+            # push_cmd_tilt_floor 0 a flat bin earns nothing.
+            tilt_w = self._tilt_band_weight()
+        out = r * (floor + (1.0 - floor) * tilt_w)
+        if self._tilt_enabled:
+            in_push = (self.stage_buf == self.STAGE_PUSH).float()
+            if bool(self.config.get("tilt_walk_ramp_in_band", False)):
+                # 2026-10-03 push2: once the bin is tilted into the band and
+                # settling in TILT, ramp in the forward walk-command reward.
+                in_tilt = (self.stage_buf == self.STAGE_TILT).float()
+                ramp_w = float(self.config.get("tilt_walk_ramp_scale", 0.5)) * self._tilt_steady_weight(
+                    float(self.config.get("tilt_walk_ramp_rate_std_dps", 25.0))
+                )
+                out = out * (in_push + in_tilt * ramp_w)
+            else:
+                out = out * in_push
+        sub_db_pen = float(self.config.get("push_cmd_sub_deadband_penalty", 0.0))
+        if sub_db_pen > 0.0 and db > 1e-4:
+            # 2026-10-04 push6: in STAGE_PUSH after the settle grace window,
+            # penalize commanding vx < db (0.50 HOMIE stand->walk switch
+            # threshold) so staying in HOMIE's stand model or commanding
+            # backward vx <= 0 is actively penalized.
+            grace = float(self.config.get("push_stall_grace_steps", 25.0))
+            ramp = max(float(self.config.get("push_stall_ramp_steps", 15.0)), 1e-3)
+            alpha = ((self.time_in_stage_buf.float() - grace) / ramp).clamp(0.0, 1.0)
+            in_push_mask = (self.stage_buf == self.STAGE_PUSH).float() * alpha
+            deficit = ((db - vx) / max(db, 1e-3)).clamp(0.0, 1.5)
+            out = out - sub_db_pen * deficit * in_push_mask
+        return out
+
     @StagedTaskBase.effective_in_stage([STAGE_APPROACH])
     def _reward_penalty_upper_body_non_finger_deviation_l1(self):
         """L1 deviation of non-finger upper-body DoFs from resting pose (arms down while walking)."""
-        return torch.abs(
+        dev = torch.abs(
             self.simulator.dof_pos[:, self._upper_non_finger_dof_idx]
             - self.resting_dof_pos[:, self._upper_non_finger_dof_idx]
         ).sum(dim=-1)
+        act_w = float(self.config.get("approach_arm_action_l1_weight", 0.0))
+        if act_w > 0.0:
+            arm_cols = self._resting_action_state()["arm_delta_cols"]
+            dev = dev + act_w * self._last_delta_actions[:, arm_cols].abs().sum(dim=-1)
+        return dev
 
     @StagedTaskBase.effective_in_stage([STAGE_APPROACH, STAGE_REACH, STAGE_GRASP])
     def _reward_penalty_face_bin(self):
@@ -2936,12 +4910,38 @@ class BinPushHomie(
         dot = (robot_forward * to_bin).sum(dim=-1)
         return 1.0 - dot
 
-    @StagedTaskBase.effective_in_stage([STAGE_REACH, STAGE_GRASP])
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT; 2026-10-04 push6: + PUSH (gated)
     def _reward_penalty_not_standing_still(self):
         """Penalize nonzero HOMIE locomotion command while reaching / grasping."""
-        return torch.norm(self.get_physical_homie_commands()[:, :3], dim=1)
+        cmd = self.get_physical_homie_commands()[:, :3]
+        if bool(self.config.get("tilt_walk_ramp_in_band", False)) and self._tilt_enabled:
+            # 2026-10-03 push2: relax the penalty on forward vx > 0 in TILT once
+            # the bin is inside the tilt band and settling (lateral vy, vyaw,
+            # and backward vx < 0 stay penalized).
+            in_tilt = (self.stage_buf == self.STAGE_TILT).float()
+            keep = (
+                1.0
+                - in_tilt
+                * self._tilt_steady_weight(
+                    float(self.config.get("tilt_walk_ramp_rate_std_dps", 25.0))
+                )
+            ).clamp(0.0, 1.0)
+            vx = torch.where(cmd[:, 0] > 0.0, cmd[:, 0] * keep, cmd[:, 0])
+            cmd = torch.stack([vx, cmd[:, 1], cmd[:, 2]], dim=-1)
+        in_push = self.stage_buf == self.STAGE_PUSH
+        if not bool(self.config.get("penalize_lateral_yaw_cmd_in_push", False)):
+            if in_push.any():
+                cmd = torch.where(in_push[:, None], torch.zeros_like(cmd), cmd)
+        else:
+            # 2026-10-04 push6: in PUSH, forward vx > 0 is free, while lateral
+            # vy, yaw rate vyaw, and backward vx < 0 are penalized so the robot
+            # walks straight forward with the bin without yaw drift.
+            vx_push = cmd[:, 0].clamp(max=0.0)
+            cmd_push = torch.stack([vx_push, cmd[:, 1], cmd[:, 2]], dim=-1)
+            cmd = torch.where(in_push[:, None], cmd_push, cmd)
+        return torch.norm(cmd, dim=1)
 
-    @StagedTaskBase.effective_in_stage([STAGE_PUSH])
+    @_effective_in_named_stages("TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_penalty_bin_wheel_kick(self):
         """Penalize foot contact with the bin's WHEEL bodies during PUSH.
 
@@ -2953,12 +4953,347 @@ class BinPushHomie(
         only (kicking the wheels is only undesirable once we're driving the bin)
         and reads the dedicated wheel contact sensor.
         """
-        wheel_contact = self.simulator.scene.sensors[
-            "bin_wheel_contact_sensor"
-        ].data.net_forces_w
-        return wheel_contact.norm(dim=-1).sum(dim=-1)
+        # 2026-09-25: force_matrix_w = (N, wheels, filtered robot links, 3):
+        # only robot-leg-on-wheel contact counts (floor contact excluded).
+        # 2026-09-27: one sensor per wheel (see scene_creation_callback).
+        total = torch.zeros(self.num_envs, device=self.device)
+        for wheel in ("wheel_left", "wheel_right"):
+            fm = self.simulator.scene.sensors[f"bin_{wheel}_contact_sensor"].data.force_matrix_w
+            if fm is not None:
+                total = total + fm.norm(dim=-1).sum(dim=(1, 2))
+        return total
 
-    @StagedTaskBase.effective_in_stage([STAGE_PUSH])
+    # ------------------------------------------------------------------
+    # 2026-09-25 handlefix3: finger WRAP around the bar + lid contact.
+    # Video + wrap_probe on 5400/5600: index/middle tips go OVER the bar and
+    # land on the lid (bin-frame dy -3..-6cm, dz +5cm vs bar centre); only
+    # the thumb tip goes under. The 5cm grasp-point gate is satisfied by a
+    # fist above the bar and the finger-closure reward pays for closing in
+    # the air. Bin frame: +x along the bar, +y from lid toward the robot
+    # (bar y 0.3425, lid panel y<0.312), +z up. Measured from each hand's
+    # raw bar point (_left/_right_bar_raw_pos).
+    # ------------------------------------------------------------------
+    def _init_hand_link_indices(self):
+        if hasattr(self, "_hand_link_sim_idx"):
+            return
+        # Same order as object_to_hand_contact_forces' filter list (see
+        # _fingertip_forces); mapped to simulator body indices for positions.
+        names = [
+            n for n in self.simulator.robot_config.body_names
+            if ("left_hand" in n or "right_hand" in n)
+        ]
+        sim_names = list(self.simulator.body_names)
+        tips = ("index_1", "middle_1", "thumb_2")
+        self._hand_link_contact_idx = {}
+        self._hand_link_sim_idx = {}
+        self._wrap_tip_sim_idx = {}
+        for side in ("left", "right"):
+            ci = [i for i, n in enumerate(names) if f"{side}_hand" in n]
+            self._hand_link_contact_idx[side] = ci
+            self._hand_link_sim_idx[side] = torch.tensor(
+                [sim_names.index(names[i]) for i in ci],
+                device=self.device, dtype=torch.long,
+            )
+            self._wrap_tip_sim_idx[side] = torch.tensor(
+                [
+                    sim_names.index(n) for n in names
+                    if f"{side}_hand" in n and any(t in n for t in tips)
+                ],
+                device=self.device, dtype=torch.long,
+            )
+
+    def _bar_frame_deltas(self, link_idx, bar_world):
+        """(N,K,3) offsets of robot links from a world bar point, in the bin frame."""
+        q_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])  # wxyz
+        d = self.simulator._rigid_body_pos[:, link_idx, :] - bar_world[:, None, :]
+        n, k, _ = d.shape
+        return quat_apply(
+            q_inv[:, None, :].expand(n, k, 4).reshape(-1, 4), d.reshape(-1, 3)
+        ).reshape(n, k, 3)
+
+    def _finger_wrap_scores(self):
+        """((wrap_l, prox_l), (wrap_r, prox_r)), each (N,3) for index_1/
+        middle_1/thumb_2. angle = phi/pi, phi measured around the bar
+        axis from the TOP (0 on top, 0.5 at the side, 1 underneath; side-
+        agnostic). prox = 1 within grasp_wrap_rho0 of the bar axis, Gaussian
+        falloff (grasp_wrap_rho_std) beyond. wrap = angle * prox."""
+        self._init_hand_link_indices()
+        if self._overhand_mode():
+            # 2026-09-29 overhand: (score, prox) from the overhand claw terms,
+            # fingers ordered (index, middle, thumb). prox = Gaussian on the
+            # distal-phalanx surface distance (grasp_ovh_prox_std, wider than
+            # the score's sigma) -- used by grasp_finger_near_gate_floor.
+            prox_std = float(self.config.get("grasp_ovh_prox_std", 0.02))
+            ovh = self._overhand_finger_terms()
+            return tuple(
+                (
+                    ovh[s][0],
+                    torch.exp(-torch.square(ovh[s][2].clamp(min=0.0) / prox_std)),
+                )
+                for s in ("left", "right")
+            )
+        r0 = float(self.config.get("grasp_wrap_rho0", 0.04))
+        std = float(self.config.get("grasp_wrap_rho_std", 0.02))
+        out = []
+        for side, bar in (
+            ("left", self._left_bar_raw_pos()),
+            ("right", self._right_bar_raw_pos()),
+        ):
+            idx = self._wrap_tip_sim_idx[side]
+            d = self._bar_frame_deltas(idx, bar)
+            wrap, prox = self._wrap_terms(side, d, r0, std)
+            if bool(self.config.get("grasp_wrap_use_tip", False)):
+                # 2026-09-28 handlefix5: also score the REAL fingertip (link
+                # origins are the PIP/IP joints, ~5.2cm short of the tip).
+                tip_w = self.simulator._rigid_body_pos[:, idx, :] + quat_apply(
+                    xyzw_to_wxyz(self.simulator._rigid_body_rot[:, idx, :].reshape(-1, 4)),
+                    self._wrap_tip_offsets(side).expand(self.num_envs, -1, -1).reshape(-1, 3),
+                ).reshape(self.num_envs, -1, 3)
+                q_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])
+                dt = tip_w - bar[:, None, :]
+                k = dt.shape[1]
+                dt = quat_apply(
+                    q_inv[:, None, :].expand(-1, k, 4).reshape(-1, 4), dt.reshape(-1, 3)
+                ).reshape(self.num_envs, k, 3)
+                wrap_t, prox_t = self._wrap_terms(side, dt, r0, std)
+                wrap, prox = 0.5 * (wrap + wrap_t), 0.5 * (prox + prox_t)
+            out.append((wrap, prox))
+        return out[0], out[1]
+
+    def _wrap_is_thumb(self, side):
+        if not hasattr(self, "_wrap_thumb_mask"):
+            sim_names = list(self.simulator.body_names)
+            self._wrap_thumb_mask = {
+                s: torch.tensor(
+                    ["thumb" in sim_names[i] for i in self._wrap_tip_sim_idx[s].tolist()],
+                    device=self.device,
+                )
+                for s in ("left", "right")
+            }
+        return self._wrap_thumb_mask[side]
+
+    def _wrap_tip_offsets(self, side):
+        """(1,K,3) link-local fingertip offsets (far point of the distal
+        collision hull, measured from g1_43dof_s3.usda by the hand probe)."""
+        if not hasattr(self, "_wrap_tip_off"):
+            finger = {"left": (0.0519, 0.0038, -0.0022), "right": (0.0519, -0.0038, 0.0022)}
+            thumb = {"left": (-0.0038, -0.0519, 0.0022), "right": (-0.0038, 0.0519, -0.0022)}
+            self._wrap_tip_off = {
+                s: torch.tensor(
+                    [thumb[s] if t else finger[s] for t in self._wrap_is_thumb(s).tolist()],
+                    device=self.device, dtype=torch.float32,
+                )[None]
+                for s in ("left", "right")
+            }
+        return self._wrap_tip_off[side]
+
+    def _wrap_terms(self, side, d, r0, std):
+        """wrap = angle * prox from bin-frame bar offsets d (N,K,3). angle =
+        phi/pi (0 on top, 1 underneath). grasp_wrap_thumb_over (handlefix5,
+        front hook): the THUMB scores 1-angle (on top = good), the fingers
+        keep angle (under = good) -- opposition, not 'everything under'."""
+        dy, dz = d[..., 1], d[..., 2]
+        rho = torch.sqrt(dy * dy + dz * dz + 1e-8)
+        # 2026-09-27 handlefix4: linear in phi (0 top, 0.5 side, 1 under).
+        # (1-cos phi)/2 had ~zero slope at the bar top, where the fingers sit.
+        angle = torch.acos((dz / rho).clamp(-1.0, 1.0)) / math.pi
+        if bool(self.config.get("grasp_wrap_thumb_over", False)):
+            angle = torch.where(self._wrap_is_thumb(side)[None, :], 1.0 - angle, angle)
+        prox = torch.exp(-torch.square((rho - r0).clamp(min=0.0) / std))
+        return angle * prox, prox
+
+    def _wrap_hand_scores(self):
+        """Per-hand aggregated wrap score (N,), same blend as the reward."""
+        (lw, _), (rw, _) = self._finger_wrap_scores()
+        w = float(self.config.get("grasp_wrap_worst_weight", 0.5))
+        agg = lambda s: (1.0 - w) * s.mean(dim=-1) + w * s.min(dim=-1).values  # noqa: E731
+        return agg(lw), agg(rw)
+
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
+    def _reward_grasp_finger_wrap(self):
+        """2026-09-25: reward every fingertip wrapping AROUND the bar (see
+        _finger_wrap_scores). Worst-finger blend (grasp_wrap_worst_weight) so
+        the index/middle fingers must wrap too, not just the thumb."""
+        (lw, _), (rw, _) = self._finger_wrap_scores()
+        w = float(self.config.get("grasp_wrap_worst_weight", 0.5))
+
+        def agg(s):
+            return (1.0 - w) * s.mean(dim=-1) + w * s.min(dim=-1).values
+
+        return 0.5 * (agg(lw) + agg(rw)) * self._grasp_shape_stage_scale()
+
+    def _lid_contact_per_hand(self):
+        """Per-hand sum over hand links of clamp(|F_bin|/Fmax, 1) for links
+        that are on the LID side of the bar (bin dy < grasp_lid_dy_max) and
+        above the bar centre (dz > grasp_lid_dz_min). Geometric region is
+        needed because the lid and handle colliders are one rigid body (the
+        contact filter can't separate them)."""
+        self._init_hand_link_indices()
+        forces = self.simulator.object_to_hand_contact_forces[:, 0, :, :].norm(dim=-1)
+        fmax = float(self.config.get("grasp_lid_contact_force_max", 5.0))
+        dy_max = float(self.config.get("grasp_lid_dy_max", -0.024))
+        dz_min = float(self.config.get("grasp_lid_dz_min", 0.0))
+        out = []
+        for side, bar in (
+            ("left", self._left_bar_raw_pos()),
+            ("right", self._right_bar_raw_pos()),
+        ):
+            d = self._bar_frame_deltas(self._hand_link_sim_idx[side], bar)
+            in_lid = ((d[..., 1] < dy_max) & (d[..., 2] > dz_min)).float()
+            if bool(self.config.get("grasp_lid_exclude_thumb", False)):
+                # 2026-09-28 handlefix5: hook thumb pad rests behind the bar.
+                sim_names = list(self.simulator.body_names)
+                non_thumb = torch.tensor(
+                    ["thumb" not in sim_names[i] for i in self._hand_link_sim_idx[side].tolist()],
+                    device=self.device, dtype=torch.float32,
+                )
+                in_lid = in_lid * non_thumb[None, :]
+            f = (forces[:, self._hand_link_contact_idx[side]] / fmax).clamp(max=1.0)
+            out.append((f * in_lid).sum(dim=-1))
+        return out[0], out[1]
+
+    @_effective_in_named_stages("REACH", "GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
+    def _reward_penalty_lid_contact(self):
+        """2026-09-25: penalize fingers/palm pressing on the lid past the bar
+        (right outer finger seen hitting the lid top in 5400/5600 videos)."""
+        left, right = self._lid_contact_per_hand()
+        return 0.5 * (left + right)
+
+    @_effective_in_named_stages("REACH", "GRASP")
+    def _reward_penalty_palm_below_bar(self):
+        """2026-09-30 reach_grasp1 fix: per hand, (bin-frame horizontal palm
+        grasp point -> bar distance < 0.10 m) * clamp((grasp_palm_min_dz - dz)
+        / 0.04, 0, 1), summed over hands (use a NEGATIVE scale). Ramps from
+        0 at the min height to 1 at 4 cm below it; far-away hands (still
+        approaching from below) are not penalised."""
+        min_dz = self._palm_min_dz() or 0.0
+        out = 0.0
+        for d in self._palm_bar_deltas_bin():
+            near = (d[:, :2].norm(dim=-1) < 0.10).float()
+            out = out + near * ((min_dz - d[:, 2]) / 0.04).clamp(0.0, 1.0)
+        return out
+
+    def _bin_tilt_back_deg(self):
+        """Signed bin tilt (deg) toward the robot (+ = top leans back toward the
+        robot / handle down / front lifts -- the human tip-onto-wheels pose)."""
+        q = self.simulator.get_task_root_state("bin")[:, 3:7]  # wxyz
+        qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        up_xy = torch.stack(
+            [2.0 * (qx * qz + qw * qy), 2.0 * (qy * qz - qw * qx)], dim=-1
+        )
+        axis_xy = F.normalize(self.push_axis_world[:, :2], dim=-1)
+        return torch.rad2deg(
+            torch.asin((-(up_xy * axis_xy).sum(dim=-1)).clamp(-1.0, 1.0))
+        )
+
+    def _bin_tilt_rate_dps(self):
+        """2026-10-03 tilt7: d/dt of _bin_tilt_back_deg (deg/s, + = tipping
+        further back). theta = asin(-up . a) with up the bin body's z axis and
+        a the horizontal unit push axis; d up/dt = w x up (w = world angular
+        velocity, root state [10:13]), so d theta/dt = -w . (up x a) /
+        cos(theta). Small-angle check, a = +x: -w_y. Checkpoint stage-4
+        snapshots (tilt5 5100 / push1): ~+31 deg/s at the handover."""
+        st = self.simulator.get_task_root_state("bin")
+        qw, qx, qy, qz = st[:, 3], st[:, 4], st[:, 5], st[:, 6]  # wxyz
+        up = torch.stack(
+            [
+                2.0 * (qx * qz + qw * qy),
+                2.0 * (qy * qz - qw * qx),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+            dim=-1,
+        )
+        a = torch.zeros_like(up)
+        a[:, :2] = F.normalize(self.push_axis_world[:, :2], dim=-1)
+        s = (-(up * a).sum(dim=-1)).clamp(-1.0, 1.0)  # sin(theta)
+        cos_t = (1.0 - s * s).clamp(min=1e-4).sqrt()
+        w = st[:, 10:13]
+        return torch.rad2deg(-(w * torch.cross(up, a, dim=-1)).sum(dim=-1) / cos_t)
+
+    def _tilt_steady_weight(self, std_dps=None):
+        """2026-10-03 push2: w_band(theta) * grip_maintained * exp(-(rate/std)^2).
+        0 for a flat or toppling bin or when the grip is lost; 1 inside [10, 22]
+        deg when the bin is held still (d theta/dt ~ 0 deg/s)."""
+        if std_dps is None:
+            std_dps = float(self.config.get("bin_tilt_steady_std_dps", 15.0))
+        rate = self._bin_tilt_rate_dps()
+        return (
+            self._tilt_band_weight()
+            * self._grip_maintained_mask().float()
+            * torch.exp(-torch.square(rate / max(std_dps, 1e-3)))
+        )
+
+    @_effective_in_named_stages("TILT", "PUSH")
+    def _reward_bin_tilt_steady(self):
+        """2026-10-03 push2: dense tilt-braking / steady-hold reward in TILT and
+        PUSH. Pays inside the tilt band [10, 22] deg with grip maintained when
+        angular rate |d theta/dt| is small (Gaussian width bin_tilt_steady_std_dps,
+        default 15 deg/s), directly rewarding the robot for arresting the
+        backward swing before/after the TILT->PUSH handover."""
+        return self._tilt_steady_weight() * self._push_motion_anti_stall_weight()
+
+    @_effective_in_named_stages("GRASP")
+    def _reward_grasp_advance(self):
+        """2026-10-04 full2: one-time milestone bonus on the step that GRASP
+        satisfies _stage_2_to_3_advance_condition() and advances into TILT
+        (or PUSH when enable_tilt_stage is False). When grasp_is_final is False,
+        complete only fires at the end of PUSH; this preserves the gate bonus at
+        GRASP->TILT while continuing live into TILT."""
+        next_stage = self.STAGE_TILT if self._tilt_enabled else self.STAGE_PUSH
+        cond = (
+            (self.stage_buf == self.STAGE_GRASP)
+            & (self.current_max_stage_buf < next_stage)
+            & ~self.just_resetted_buf
+            & ~self.reset_buf.bool()
+            & self._stage_2_to_3_advance_condition()
+        )
+        return cond.float()
+
+    @_effective_in_named_stages("TILT")
+    def _reward_tilt_advance(self):
+        """2026-10-03 push3: one-time milestone bonus on the step that TILT
+        satisfies _stage_3_to_4_advance_condition() and advances into PUSH
+        (when tilt_is_final is False, complete only fires at the end of PUSH;
+        this preserves tilt5/tilt7's +20 gate bonus while continuing live into
+        PUSH)."""
+        if not self._tilt_enabled:
+            return torch.zeros(self.num_envs, device=self.device)
+        cond = (
+            (self.stage_buf == self.STAGE_TILT)
+            & (self.current_max_stage_buf < self.STAGE_PUSH)
+            & ~self.just_resetted_buf
+            & ~self.reset_buf.bool()
+            & self._stage_3_to_4_advance_condition()
+        )
+        return cond.float()
+
+    @_effective_in_named_stages("TILT", "PUSH")  # 2026-09-29 overhand: + TILT
+    def _reward_bin_tilt_back(self):
+        """2026-09-25: POSITIVE reward for tipping the bin back onto its wheels.
+
+        Gaussian in signed back-tilt, peaking at bin_tilt_target_deg (15) with
+        a wide std (bin_tilt_back_std_deg, 10) so an upright bin (0 deg) still
+        sees a gradient (exp(-2.25) ~ 0.11). The existing penalty_bin_tilt only
+        penalized deviation (max 0.068/step) -- too weak to shape anything, and
+        the bin can't roll without tipping (front base drags on the floor).
+        """
+        t = float(self.config.get("bin_tilt_target_deg", 15.0))
+        std = float(self.config.get("bin_tilt_back_std_deg", 10.0))
+        raw = torch.exp(-torch.square((self._bin_tilt_back_deg() - t) / std))
+        if bool(self.config.get("bin_tilt_back_zero_at_upright", False)):
+            # 2026-10-03 push4/push5: subtract the Gaussian value at
+            # bin_tilt_back_min_deg_tilt (default 0.0 deg; 4.0 deg in push5) in
+            # TILT and gate by grip maintained, so parking flat or slightly
+            # rocked (<= min_deg_tilt) in TILT earns 0.0 instead of farming the
+            # Gaussian tail.
+            min_deg_t = float(self.config.get("bin_tilt_back_min_deg_tilt", 0.0))
+            b0 = math.exp(-((min_deg_t - t) / std) ** 2)
+            norm_tilt = ((raw - b0) / max(1.0 - b0, 1e-4)).clamp(min=0.0, max=1.0)
+            in_tilt = self.stage_buf == self.STAGE_TILT
+            raw = torch.where(in_tilt, norm_tilt, raw) * self._grip_maintained_mask().float()
+        return raw * self._push_motion_anti_stall_weight()
+
+    @_effective_in_named_stages("PUSH")
     def _reward_penalty_bin_tilt(self):
         """Penalize the bin deviating from a TARGET backward tilt during PUSH.
 
@@ -2974,8 +5309,9 @@ class BinPushHomie(
            bolt-upright. Penalize squared deviation of the bin up-axis from the
            tilted target up-axis.
         """
-        bin_quat_xyzw = self.simulator.get_task_root_state("bin")[:, 3:7]
-        bin_up = quat_apply(xyzw_to_wxyz(bin_quat_xyzw),
+        # get_task_root_state returns wxyz (same as L375); do NOT reorder.
+        bin_quat_wxyz = self.simulator.get_task_root_state("bin")[:, 3:7]
+        bin_up = quat_apply(bin_quat_wxyz,
                             torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(self.num_envs, 1))
 
         # Target up-axis = vertical tilted back toward the robot by target angle.
@@ -2990,7 +5326,7 @@ class BinPushHomie(
         target_up[:, 2] = torch.cos(t)
         return torch.sum(torch.square(bin_up - target_up), dim=-1)
 
-    @StagedTaskBase.effective_in_stage([STAGE_GRASP, STAGE_PUSH])
+    @_effective_in_named_stages("GRASP", "TILT", "PUSH")  # 2026-09-29 overhand: + TILT
     def _reward_penalty_asymmetric_grasp(self):
         """Penalize imbalance between left and right hand bar distances.
 
@@ -3084,6 +5420,55 @@ class BinPushHomie(
 
         r, p, _ = euler_xyz_from_quat(self.target_robot_root_states[env_ids, 3:7])
 
+        # 2026-10-06 full3: Polar STAGE_APPROACH Spawn DR with FOV-locked yaw.
+        # Samples radial distance d ~ U[d_min, d_max] and azimuth phi ~ U[-phi_max, +phi_max]
+        # behind the grasp stop target (stop_ox, stop_oy) = (-0.8733, 0.0), then sets
+        # robot yaw = atan2(bar_y - y, bar_x - x) + delta_psi_fov so the bin handle bar
+        # always starts inside the d435_link camera horizontal FOV.
+        if getattr(self, "_spawn_polar_dr", False):
+            d_min, d_max, phi_max_deg, fov_yaw_max_deg = self._spawn_polar_active_bounds()
+            n_ids = len(env_ids)
+            d = torch_rand_float(
+                float(d_min), float(d_max), (n_ids, 1), device=str(self.device)
+            )[:, 0]
+            phi_max_rad = math.radians(float(phi_max_deg))
+            phi = torch_rand_float(
+                -phi_max_rad, phi_max_rad, (n_ids, 1), device=str(self.device)
+            )[:, 0]
+            stop_ox = float(self.config.get("spawn_polar_stop_offset_x", -0.8733))
+            stop_oy = float(self.config.get("spawn_polar_stop_offset_y", 0.0))
+            bar_ox = float(self.config.get("spawn_polar_bar_offset_x", -0.3413))
+            bar_oy = float(self.config.get("spawn_polar_bar_offset_y", 0.0))
+            rel_x0 = stop_ox - d * torch.cos(phi)
+            rel_y0 = stop_oy + d * torch.sin(phi)
+            dyaw = (
+                self._spawn_bin_yaw_rad[env_ids]
+                if hasattr(self, "_spawn_bin_yaw_rad")
+                else torch.zeros_like(d)
+            )
+            c_bin = torch.cos(dyaw)
+            s_bin = torch.sin(dyaw)
+            rel_x = c_bin * rel_x0 - s_bin * rel_y0
+            rel_y = s_bin * rel_x0 + c_bin * rel_y0
+            self.target_robot_root_states[env_ids, 0] = self.env_origins[env_ids, 0] + rel_x
+            self.target_robot_root_states[env_ids, 1] = self.env_origins[env_ids, 1] + rel_y
+
+            psi_look = torch.atan2(bar_oy - rel_y0, bar_ox - rel_x0) + dyaw
+            fov_yaw_rad = math.radians(float(fov_yaw_max_deg))
+            delta_psi = torch_rand_float(
+                -fov_yaw_rad, fov_yaw_rad, (n_ids, 1), device=str(self.device)
+            )[:, 0]
+            random_yaw = psi_look + delta_psi
+            zero_rp = torch.zeros_like(random_yaw)
+            self.target_robot_root_states[env_ids, 3:7] = quat_from_euler_xyz(
+                zero_rp, zero_rp, random_yaw
+            )
+            self._spawn_dr_init_dist[env_ids] = d
+            self._spawn_dr_init_phi_deg[env_ids] = phi * (180.0 / math.pi)
+            self._spawn_dr_init_yaw_deg[env_ids] = random_yaw * (180.0 / math.pi)
+            self._spawn_dr_ep_level[env_ids] = float(self.spawn_dr_dist_level_m)
+            return
+
         # Push axis is +X world (v1 locked). Spawn G1 ~2 m behind bin at env origin,
         # so along -X. Small XY jitter, tight yaw range so we face the bin.
         # spawn_x_range config-driven so an ISOLATION experiment (Run 12b) can spawn
@@ -3094,15 +5479,21 @@ class BinPushHomie(
             self.env_origins[env_ids, 0:1]
             + torch_rand_float(float(spawn_x[0]), float(spawn_x[1]), (len(env_ids), 1), device=str(self.device))
         )
+        # 2026-09-29 reach_grasp: lateral / yaw jitter config-driven
+        # (spawn_y_range, spawn_yaw_range_deg). Defaults = old hardcoded
+        # ±0.3 m / ±15°; the reach->grasp exp spawns inside the stop-pose
+        # tolerance (stop_transition_lateral_tolerance 0.12).
+        spawn_y = self.config.get("spawn_y_range", [-0.3, 0.3])
         self.target_robot_root_states[env_ids, 1:2] = (
             self.env_origins[env_ids, 1:2]
-            + torch_rand_float(-0.3, 0.3, (len(env_ids), 1), device=str(self.device))
+            + torch_rand_float(float(spawn_y[0]), float(spawn_y[1]), (len(env_ids), 1), device=str(self.device))
         )
 
         # Yaw facing +X (toward the bin). ±15° jitter.
+        yaw_jitter = math.radians(float(self.config.get("spawn_yaw_range_deg", 15.0)))
         random_yaw = torch_rand_float(
-            -torch.pi / 12,
-            torch.pi / 12,
+            -yaw_jitter,
+            yaw_jitter,
             (len(env_ids), 1), device=str(self.device)
         )[:, 0]
         zero_rp = torch.zeros_like(random_yaw)
@@ -3183,18 +5574,1284 @@ class BinPushHomie(
         self.target_robot_dof_state[env_ids, :, 1] = 0.0
 
     @override
+    def set_to_stage(self, env_ids, stage):
+        super().set_to_stage(env_ids, stage)
+        # 2026-10-01: remember the stage the new episode starts in (stage-0
+        # fresh start, staged-reset snapshot, or grasp-init TILT).
+        if hasattr(self, "_ep_start_stage"):
+            self._ep_start_stage[env_ids] = stage
+
+    def _record_episode_outcomes(self, env_ids):
+        """2026-10-01 success metrics (logging only). For every env in env_ids
+        whose episode actually ran (total_time_buf > 0, i.e. not the startup
+        reset), push one row into a ring buffer of the last
+        `success_metrics_window` (512) ended episodes and recompute:
+
+        - episode_success_frac: completed (the task's complete condition was
+          met during the episode -- works for grasp_is_final and tilt_is_final).
+        - grasp_reliable_frac: of episodes that were in GRASP (started at or
+          before GRASP and reached it), the fraction that later reached TILT.
+          Episodes that STARTED in TILT (grasp-init / TILT snapshots) are
+          excluded.
+        - tilt_success_frac: of episodes that were in TILT (incl. TILT
+          starts), the fraction that completed.
+        - time_to_success_s: mean episode time at completion.
+        - grasp_success_frac: of episodes that STARTED at or before GRASP, the
+          fraction that reached TILT (pass the grasp gate). Same quantity as
+          Env/average_goal_reached in the grasp_is_final runs (reach_grasp2),
+          for the pre/post-switch comparison.
+
+        Written to log_dict only here; log_dict persists between steps, so the
+        trainer's per-step average carries the last value through steps with no
+        resets instead of being diluted by them. A metric whose denominator is
+        empty in the window keeps its previous value."""
+        if not hasattr(self, "_succ_buf") or len(env_ids) == 0:
+            return
+        ran = self.total_time_buf[env_ids] > 0
+        ids = env_ids[ran]
+        if len(ids) == 0:
+            return
+        g, t = self.STAGE_GRASP, self.STAGE_TILT
+        start = self._ep_start_stage[ids]
+        mx = self.current_max_stage_buf[ids]
+        done = self.current_completed_task_buf[ids]
+        entered_grasp = (start <= g) & (mx >= g)
+        if t >= 0:
+            reached_tilt = entered_grasp & (mx >= t)
+            entered_tilt = mx >= t
+        else:
+            reached_tilt = torch.zeros_like(entered_grasp)
+            entered_tilt = torch.zeros_like(entered_grasp)
+        tsc = self.time_since_completion_buf[ids]
+        t_done = (self.total_time_buf[ids] - (tsc - 1).clamp(min=0)).float() * float(self.dt)
+        # 2026-10-03 push1: reached PUSH, and the episode's bin body mass (still
+        # the ended episode's: _apply_bin_mass_curriculum re-samples after this
+        # call in _reset_tasks_callback).
+        p = self.STAGE_PUSH
+        reached_push = (mx >= p) if p >= 0 else torch.zeros_like(entered_grasp)
+        started_approach = start == self.STAGE_APPROACH
+        reached_reach = started_approach & (mx >= self.STAGE_REACH)
+        rows = torch.stack(
+            [done.float(), entered_grasp.float(), reached_tilt.float(),
+             entered_tilt.float(), torch.where(done, t_done, torch.zeros_like(t_done)),
+             (start <= g).float(), reached_push.float(), self._bin_mass_env[ids].float(),
+             started_approach.float(), reached_reach.float()],
+            dim=-1,
+        )[-self._succ_win:]
+        k = rows.shape[0]
+        idx = (torch.arange(k, device=self.device) + self._succ_ptr) % self._succ_win
+        self._succ_buf[idx] = rows
+        self._succ_ptr = (self._succ_ptr + k) % self._succ_win
+        self._succ_count = min(self._succ_count + k, self._succ_win)
+        b = self._succ_buf[: self._succ_count] if self._succ_count < self._succ_win else self._succ_buf
+        c, eg, rt, et, tt, sg, rp, mk, sa, rr = b.unbind(-1)
+        self.log_dict["episode_success_frac"] = c.mean()
+        self.log_dict["success_window_episodes"] = torch.tensor(float(b.shape[0]), device=self.device)
+        if sa.sum() > 0:
+            self.log_dict["approach_reached_frac"] = (rr * sa).sum() / sa.sum()
+            self.log_dict["approach_ep_success_frac"] = (c * sa).sum() / sa.sum()
+        if eg.sum() > 0:
+            self.log_dict["grasp_reliable_frac"] = (rt * eg).sum() / eg.sum()
+        if sg.sum() > 0:
+            self.log_dict["grasp_success_frac"] = (rt * sg).sum() / sg.sum()
+        if et.sum() > 0:
+            self.log_dict["tilt_success_frac"] = (c * et).sum() / et.sum()
+        if c.sum() > 0:
+            self.log_dict["time_to_success_s"] = (tt * c).sum() / c.sum()
+        # 2026-10-03 push1 (push_stage_logs, default False): with tilt_is_final
+        # off, "completed" = PUSH complete, so tilt_success_frac above becomes
+        # the PUSH success of TILT episodes. push_reached_frac = of episodes in
+        # TILT, the fraction that passed the TILT->PUSH gate (the old tilt
+        # success); push_success_frac = of those, the fraction that completed.
+        push_logs = bool(self.config.get("push_stage_logs", False))
+        if push_logs:
+            if et.sum() > 0:
+                self.log_dict["push_reached_frac"] = (rp * et).sum() / et.sum()
+            if rp.sum() > 0:
+                self.log_dict["push_success_frac"] = (c * rp).sum() / rp.sum()
+        # 2026-10-03 push1 (success_by_mass_edges_kg, default None): episode
+        # success (and PUSH reached, with push_stage_logs) per bin body-mass
+        # bucket [lo, hi) over the same window, e.g. [6, 9, 11, 13] ->
+        # episode_success_frac_m6_9 / _m9_11 / _m11_13.
+        edges = self.config.get("success_by_mass_edges_kg", None)
+        if edges:
+            edges = [float(e) for e in edges]
+            for lo, hi in zip(edges[:-1], edges[1:]):
+                sel = ((mk >= lo) & (mk < hi)).float()
+                n = sel.sum()
+                if n > 0:
+                    tag = f"m{lo:g}_{hi:g}"
+                    self.log_dict[f"episode_success_frac_{tag}"] = (c * sel).sum() / n
+                    if push_logs:
+                        self.log_dict[f"push_reached_frac_{tag}"] = (rp * sel).sum() / n
+
+    @override
+    def load_env_state_dict(self, state_dict):
+        """2026-10-02 grasp_tilt4 (bin_mass_level_reset_kg, default None = old
+        behaviour). The base load restores bin_mass_level_kg from the
+        checkpoint's env state (= log_dict), so bin_mass_start_kg alone cannot
+        LOWER the level on a resume (m10 sat at 6 kg: 4-6 kg bins are
+        edge-held, 2-3 kg bins tip and succeed). If bin_mass_level_reset_kg is
+        set, put the level back to it and clear the level counts ONCE: the
+        checkpoints of the run then carry bin_mass_level_reset_applied_kg
+        (written in _update_bin_mass_curriculum), and a later resume with the
+        same reset value keeps the restored (possibly advanced) level."""
+        state_dict = dict(state_dict)
+        # popped so the base load does not warn "Key ... not found"
+        applied = state_dict.pop("bin_mass_level_reset_applied_kg", None)
+        push_reset_applied = state_dict.pop("push_distance_level_reset_applied_m", None)
+        spawn_reset_applied = state_dict.pop("spawn_polar_dist_level_reset_applied_m", None)
+        super().load_env_state_dict(state_dict)
+        self._post_load_tilt_rate_gate()  # 2026-10-03 tilt7
+        self._post_load_push_distance_curriculum(push_reset_applied)  # 2026-10-03 push2 / full3
+        self._post_load_spawn_dr_curriculum(spawn_reset_applied)  # 2026-10-06 full3
+        reset_kg = self.config.get("bin_mass_level_reset_kg", None)
+        if reset_kg is None or not getattr(self, "_bin_mass_cur", False):
+            return
+        reset_kg = float(reset_kg)
+        if applied is not None and abs(float(applied) - reset_kg) < 1e-6:
+            logger.info(
+                f"bin mass curriculum: level reset to {reset_kg:.2f} kg already applied "
+                f"(checkpoint marker); keeping restored level "
+                f"{float(self.bin_mass_level_kg):.2f} kg"
+            )
+            return
+        old = float(self.bin_mass_level_kg)
+        self.bin_mass_level_kg = torch.tensor(reset_kg, device=self.device)
+        self._bin_mass_lvl_eps = 0
+        self._bin_mass_lvl_succ = 0
+        self.log_dict["bin_mass_level_kg"] = self.bin_mass_level_kg.clone()
+        self.log_dict["bin_mass_level_reset_applied_kg"] = torch.tensor(
+            reset_kg, device=self.device
+        )
+        logger.info(
+            f"bin mass curriculum: level reset {old:.2f} -> {reset_kg:.2f} kg "
+            f"(bin_mass_level_reset_kg)"
+        )
+
+    def _post_load_push_distance_curriculum(self, reset_applied=None):
+        """2026-10-03 push2: clamp restored target_bin_push_distance_m to
+        [push_distance_start_m, push_distance_end_m] after checkpoint load,
+        and optionally apply push_distance_level_reset_m once."""
+        if not getattr(self, "_push_dist_cur", False):
+            return
+        start = float(self.config.get("push_distance_start_m", 0.10))
+        end = max(float(self.config.get("push_distance_end_m", 1.00)), start)
+        lvl = min(max(float(self.target_bin_push_distance_m), start), end)
+        reset_m = self.config.get("push_distance_level_reset_m", None)
+        if reset_m is not None:
+            reset_m = float(reset_m)
+            if reset_applied is None or abs(float(reset_applied) - reset_m) > 1e-6:
+                logger.info(
+                    f"push distance curriculum: level reset {lvl:.2f} -> {reset_m:.2f} m "
+                    f"(push_distance_level_reset_m)"
+                )
+                lvl = reset_m
+                self.log_dict["push_distance_level_reset_applied_m"] = torch.tensor(
+                    reset_m, device=self.device
+                )
+        self.target_bin_push_distance_m = torch.tensor(lvl, device=self.device)
+        self._push_dist_ep_level[:] = lvl
+        self._push_dist_lvl_eps = 0
+        self._push_dist_lvl_succ = 0
+        self.log_dict["target_bin_push_distance_m"] = self.target_bin_push_distance_m.clone()
+        logger.info(
+            f"push distance curriculum: target {lvl:.2f} m after checkpoint load "
+            f"(range [{start:.2f}, {end:.2f}] m)"
+        )
+
+    def _post_load_spawn_dr_curriculum(self, reset_applied=None):
+        """2026-10-06 full3: clamp restored spawn_dr_dist_level_m to
+        [spawn_polar_dist_start_m, spawn_polar_dist_max_m] after checkpoint load,
+        and optionally apply spawn_polar_dist_level_reset_m once."""
+        if not getattr(self, "_spawn_polar_dr", False):
+            return
+        start = float(self.config.get("spawn_polar_dist_start_m", 0.25))
+        end = max(float(self.config.get("spawn_polar_dist_max_m", 1.10)), start)
+        if getattr(self, "_spawn_polar_cur", False):
+            lvl = min(max(float(self.spawn_dr_dist_level_m), start), end)
+            reset_m = self.config.get("spawn_polar_dist_level_reset_m", None)
+            if reset_m is not None:
+                reset_m = float(reset_m)
+                if reset_applied is None or abs(float(reset_applied) - reset_m) > 1e-6:
+                    logger.info(
+                        f"spawn polar DR curriculum: level reset {lvl:.2f} -> {reset_m:.2f} m "
+                        f"(spawn_polar_dist_level_reset_m)"
+                    )
+                    lvl = reset_m
+                    self.log_dict["spawn_polar_dist_level_reset_applied_m"] = torch.tensor(
+                        reset_m, device=self.device
+                    )
+        else:
+            lvl = end
+        self.spawn_dr_dist_level_m = torch.tensor(lvl, device=self.device)
+        self._spawn_dr_ep_level[:] = lvl
+        self._spawn_dr_lvl_eps = 0
+        self._spawn_dr_lvl_reach = 0
+        self._spawn_dr_lvl_succ = 0
+        _, _, phi_cur, yaw_cur = self._spawn_polar_active_bounds()
+        self.log_dict["spawn_dr_dist_level_m"] = self.spawn_dr_dist_level_m.clone()
+        self.log_dict["spawn_dr_phi_level_deg"] = torch.tensor(phi_cur, device=self.device)
+        self.log_dict["spawn_dr_fov_yaw_level_deg"] = torch.tensor(yaw_cur, device=self.device)
+        logger.info(
+            f"spawn polar DR: dist_level={lvl:.2f} m, phi_max={phi_cur:.1f} deg, "
+            f"fov_yaw_max={yaw_cur:.1f} deg after checkpoint load"
+        )
+
+    def _update_spawn_dr_curriculum(self, env_ids):
+        """2026-10-06 full3 (spawn_polar_curriculum, default False): count ended
+        episodes that started in STAGE_APPROACH at the current spawn_dr_dist_level_m,
+        how many reached STAGE_REACH, and how many completed the full task. Once >=
+        spawn_polar_curriculum_min_episodes (800) are counted: if reach_rate >=
+        spawn_polar_curriculum_advance_reach (0.75) AND ep_succ_rate >=
+        spawn_polar_curriculum_advance_success (0.50), advance spawn_dr_dist_level_m
+        by spawn_polar_dist_step_m (0.15 m, capped at spawn_polar_dist_max_m 1.10 m)
+        and reset counts; otherwise halve counts. Must run before
+        super()._reset_tasks_callback."""
+        if not getattr(self, "_spawn_polar_cur", False) or len(env_ids) == 0:
+            return
+        lvl = float(self.spawn_dr_dist_level_m)
+        ran = self.total_time_buf[env_ids] > 0
+        cur = (
+            ran
+            & (self._ep_start_stage[env_ids] == self.STAGE_APPROACH)
+            & ((self._spawn_dr_ep_level[env_ids] - lvl).abs() < 1e-4)
+        )
+        n = int(cur.sum())
+        if n > 0:
+            self._spawn_dr_lvl_eps += n
+            self._spawn_dr_lvl_reach += int(
+                (cur & (self.current_max_stage_buf[env_ids] >= self.STAGE_REACH)).sum()
+            )
+            self._spawn_dr_lvl_succ += int(
+                (cur & self.current_completed_task_buf[env_ids]).sum()
+            )
+        end = float(self.config.get("spawn_polar_dist_max_m", 1.10))
+        need = int(self.config.get("spawn_polar_curriculum_min_episodes", 800))
+        thr_reach = float(self.config.get("spawn_polar_curriculum_advance_reach", 0.75))
+        thr_succ = float(self.config.get("spawn_polar_curriculum_advance_success", 0.50))
+        if self._spawn_dr_lvl_eps >= need:
+            reach_rate = self._spawn_dr_lvl_reach / max(self._spawn_dr_lvl_eps, 1)
+            succ_rate = self._spawn_dr_lvl_succ / max(self._spawn_dr_lvl_eps, 1)
+            if reach_rate >= thr_reach and succ_rate >= thr_succ and lvl < end - 1e-6:
+                step = float(self.config.get("spawn_polar_dist_step_m", 0.15))
+                new = min(end, round(lvl + step, 4))
+                self.spawn_dr_dist_level_m = torch.tensor(new, device=self.device)
+                _, _, phi_new, yaw_new = self._spawn_polar_active_bounds()
+                logger.info(
+                    f"spawn polar DR curriculum: {lvl:.2f} -> {new:.2f} m "
+                    f"(phi_max={phi_new:.1f} deg, fov_yaw_max={yaw_new:.1f} deg; "
+                    f"reach={reach_rate:.3f}, succ={succ_rate:.3f} over "
+                    f"{self._spawn_dr_lvl_eps} APPROACH episodes)"
+                )
+                self._spawn_dr_lvl_eps = 0
+                self._spawn_dr_lvl_reach = 0
+                self._spawn_dr_lvl_succ = 0
+            elif lvl < end - 1e-6:
+                self._spawn_dr_lvl_eps //= 2
+                self._spawn_dr_lvl_reach //= 2
+                self._spawn_dr_lvl_succ //= 2
+        _, _, phi_cur, yaw_cur = self._spawn_polar_active_bounds()
+        self.log_dict["spawn_dr_dist_level_m"] = self.spawn_dr_dist_level_m.clone()
+        self.log_dict["spawn_dr_phi_level_deg"] = torch.tensor(phi_cur, device=self.device)
+        self.log_dict["spawn_dr_fov_yaw_level_deg"] = torch.tensor(yaw_cur, device=self.device)
+        self.log_dict["spawn_dr_level_episodes"] = torch.tensor(
+            float(self._spawn_dr_lvl_eps), device=self.device
+        )
+        if self._spawn_dr_lvl_eps > 0:
+            self.log_dict["spawn_dr_level_reach_frac"] = torch.tensor(
+                self._spawn_dr_lvl_reach / self._spawn_dr_lvl_eps, device=self.device
+            )
+            self.log_dict["spawn_dr_level_succ_frac"] = torch.tensor(
+                self._spawn_dr_lvl_succ / self._spawn_dr_lvl_eps, device=self.device
+            )
+        reset_m = self.config.get("spawn_polar_dist_level_reset_m", None)
+        if reset_m is not None:
+            self.log_dict["spawn_polar_dist_level_reset_applied_m"] = torch.tensor(
+                float(reset_m), device=self.device
+            )
+
+    def _update_push_distance_curriculum(self, env_ids):
+        """2026-10-03 push2 (push_distance_curriculum, default False): count
+        ended episodes that ran at the current target_bin_push_distance_m and
+        entered PUSH, and how many completed. Once >=
+        push_distance_advance_min_episodes (1500) are counted: success >=
+        push_distance_advance_success (0.40) -> target += push_distance_step_m
+        (0.05, capped at push_distance_end_m 1.0) and reset counts; otherwise
+        halve counts. Must run before super()._reset_tasks_callback."""
+        if not getattr(self, "_push_dist_cur", False) or len(env_ids) == 0:
+            return
+        lvl = float(self.target_bin_push_distance_m)
+        ran = self.total_time_buf[env_ids] > 0
+        cur = ran & ((self._push_dist_ep_level[env_ids] - lvl).abs() < 1e-4)
+        if self.STAGE_PUSH >= 0:
+            cur = cur & (self.current_max_stage_buf[env_ids] >= self.STAGE_PUSH)
+        n = int(cur.sum())
+        if n > 0:
+            self._push_dist_lvl_eps += n
+            self._push_dist_lvl_succ += int(
+                (cur & self.current_completed_task_buf[env_ids]).sum()
+            )
+        end = float(self.config.get("push_distance_end_m", 1.00))
+        need = int(self.config.get("push_distance_advance_min_episodes", 1500))
+        thr = float(self.config.get("push_distance_advance_success", 0.40))
+        if self._push_dist_lvl_eps >= need:
+            rate = self._push_dist_lvl_succ / max(self._push_dist_lvl_eps, 1)
+            if rate >= thr and lvl < end - 1e-6:
+                step = float(self.config.get("push_distance_step_m", 0.05))
+                sched = self.config.get("push_distance_step_schedule", None)
+                if sched:
+                    for max_lvl, s_val in sched:
+                        if lvl < float(max_lvl) - 1e-6:
+                            step = float(s_val)
+                            break
+                new = min(end, round(lvl + step, 4))
+                logger.info(
+                    f"push distance curriculum: {lvl:.2f} -> {new:.2f} m (push success "
+                    f"{rate:.3f} over {self._push_dist_lvl_eps} PUSH episodes)"
+                )
+                self.target_bin_push_distance_m = torch.tensor(new, device=self.device)
+                self._push_dist_lvl_eps = 0
+                self._push_dist_lvl_succ = 0
+            elif lvl < end - 1e-6:
+                self._push_dist_lvl_eps //= 2
+                self._push_dist_lvl_succ //= 2
+        self.log_dict["target_bin_push_distance_m"] = self.target_bin_push_distance_m.clone()
+        reset_m = self.config.get("push_distance_level_reset_m", None)
+        if reset_m is not None:
+            self.log_dict["push_distance_level_reset_applied_m"] = torch.tensor(
+                float(reset_m), device=self.device
+            )
+        self.log_dict["push_dist_level_episodes"] = torch.tensor(
+            float(self._push_dist_lvl_eps), device=self.device
+        )
+        if self._push_dist_lvl_eps > 0:
+            self.log_dict["push_dist_level_success"] = torch.tensor(
+                self._push_dist_lvl_succ / self._push_dist_lvl_eps, device=self.device
+            )
+
+    def _post_load_tilt_rate_gate(self):
+        """2026-10-03 tilt7: the base load restored tilt_gate_max_rate_dps if
+        the checkpoint has it (a pre-tilt7 checkpoint does not -> the start
+        value stays). Fixed threshold (no tilt_rate_curriculum_start_dps):
+        always the configured tilt_advance_max_rate_dps. Curriculum: clamp to
+        [tilt_advance_max_rate_dps, tilt_rate_curriculum_start_dps]. Then give
+        it to the episodes already running and clear the level counts."""
+        if not getattr(self, "_tilt_rate_gate", False):
+            return
+        floor = float(self.config["tilt_advance_max_rate_dps"])
+        if self._tilt_rate_cur:
+            start = max(float(self.config["tilt_rate_curriculum_start_dps"]), floor)
+            thr = min(max(float(self.tilt_gate_max_rate_dps), floor), start)
+        else:
+            thr = floor
+        self.tilt_gate_max_rate_dps = torch.tensor(thr, device=self.device)
+        self._tilt_rate_thr_env[:] = thr
+        self._tilt_rate_lvl_eps = 0
+        self._tilt_rate_lvl_succ = 0
+        self.log_dict["tilt_gate_max_rate_dps"] = self.tilt_gate_max_rate_dps.clone()
+        logger.info(
+            f"tilt rate gate: threshold {thr:.2f} deg/s after checkpoint load "
+            f"(floor {floor:.2f}, curriculum {'on' if self._tilt_rate_cur else 'off'})"
+        )
+
+    def _update_tilt_rate_curriculum(self, env_ids):
+        """2026-10-03 tilt7 (tilt_rate_curriculum_start_dps, default None =
+        fixed threshold): count the ended episodes that ran with the CURRENT
+        threshold (_tilt_rate_thr_env, set at their reset) and entered TILT,
+        and how many of them completed (= tilt_success_frac's definition with
+        tilt_is_final). Once >= tilt_rate_curriculum_min_episodes (3000) are
+        counted: success >= tilt_rate_curriculum_success (0.5) -> threshold *=
+        tilt_rate_curriculum_factor (0.9; floor tilt_advance_max_rate_dps) and
+        reset the counts; success < tilt_rate_curriculum_loosen_success
+        (default None = never) -> threshold /= factor (cap: the start value)
+        and reset the counts; otherwise halve both counts (as in
+        _update_bin_mass_curriculum). Must run before
+        super()._reset_tasks_callback (current-episode buffers)."""
+        if not getattr(self, "_tilt_rate_cur", False) or len(env_ids) == 0:
+            return
+        thr = float(self.tilt_gate_max_rate_dps)
+        ran = self.total_time_buf[env_ids] > 0
+        cur = ran & ((self._tilt_rate_thr_env[env_ids] - thr).abs() < 1e-3)
+        if self.STAGE_TILT >= 0:
+            cur = cur & (self.current_max_stage_buf[env_ids] >= self.STAGE_TILT)
+        n = int(cur.sum())
+        if n > 0:
+            self._tilt_rate_lvl_eps += n
+            if bool(self.config.get("tilt_is_final", False)):
+                gate_ok = self.current_completed_task_buf[env_ids]
+            else:
+                gate_ok = self.current_max_stage_buf[env_ids] >= self.STAGE_PUSH
+            self._tilt_rate_lvl_succ += int((cur & gate_ok).sum())
+        need = int(self.config.get("tilt_rate_curriculum_min_episodes", 3000))
+        if self._tilt_rate_lvl_eps >= need:
+            floor = float(self.config["tilt_advance_max_rate_dps"])
+            start = max(float(self.config["tilt_rate_curriculum_start_dps"]), floor)
+            factor = float(self.config.get("tilt_rate_curriculum_factor", 0.9))
+            adv = float(self.config.get("tilt_rate_curriculum_success", 0.5))
+            loosen = self.config.get("tilt_rate_curriculum_loosen_success", None)
+            rate = self._tilt_rate_lvl_succ / max(self._tilt_rate_lvl_eps, 1)
+            new = None
+            if rate >= adv and thr > floor + 1e-6:
+                new = max(floor, thr * factor)
+            elif loosen is not None and rate < float(loosen) and thr < start - 1e-6:
+                new = min(start, thr / factor)
+            if new is not None:
+                logger.info(
+                    f"tilt rate curriculum: {thr:.2f} -> {new:.2f} deg/s (tilt success "
+                    f"{rate:.3f} over {self._tilt_rate_lvl_eps} TILT episodes)"
+                )
+                self.tilt_gate_max_rate_dps = torch.tensor(new, device=self.device)
+                self._tilt_rate_lvl_eps = 0
+                self._tilt_rate_lvl_succ = 0
+            else:
+                self._tilt_rate_lvl_eps //= 2
+                self._tilt_rate_lvl_succ //= 2
+        self.log_dict["tilt_gate_max_rate_dps"] = self.tilt_gate_max_rate_dps.clone()
+        self.log_dict["tilt_rate_level_episodes"] = torch.tensor(
+            float(self._tilt_rate_lvl_eps), device=self.device
+        )
+        if self._tilt_rate_lvl_eps > 0:
+            self.log_dict["tilt_rate_level_success"] = torch.tensor(
+                self._tilt_rate_lvl_succ / self._tilt_rate_lvl_eps, device=self.device
+            )
+
+    def _update_bin_mass_curriculum(self, env_ids):
+        """2026-10-01 tilt3 (bin_mass_curriculum, default off): count the ended
+        episodes whose bin mass was sampled at the CURRENT level and that
+        entered TILT, and how many of them completed (= tilt_success_frac's
+        definition). Once >= bin_mass_advance_min_episodes (3000) are counted:
+        tilt success >= bin_mass_advance_success (0.3) -> level +=
+        bin_mass_step_kg (1, capped at bin_mass_end_kg 15) and reset the
+        counts; otherwise halve both counts (forget the oldest half, so a
+        policy that improves is not held back by its early failures). Must run
+        before super()._reset_tasks_callback (current-episode buffers)."""
+        if not getattr(self, "_bin_mass_cur", False) or len(env_ids) == 0:
+            return
+        lvl = float(self.bin_mass_level_kg)
+        ran = self.total_time_buf[env_ids] > 0
+        cur = ran & ((self._bin_mass_ep_level[env_ids] - lvl).abs() < 1e-3)
+        if self.STAGE_TILT >= 0:
+            cur = cur & (self.current_max_stage_buf[env_ids] >= self.STAGE_TILT)
+        n = int(cur.sum())
+        if n > 0:
+            self._bin_mass_lvl_eps += n
+            self._bin_mass_lvl_succ += int((cur & self.current_completed_task_buf[env_ids]).sum())
+        end = float(self.config.get("bin_mass_end_kg", 15.0))
+        need = int(self.config.get("bin_mass_advance_min_episodes", 3000))
+        thr = float(self.config.get("bin_mass_advance_success", 0.3))
+        if self._bin_mass_lvl_eps >= need:
+            rate = self._bin_mass_lvl_succ / max(self._bin_mass_lvl_eps, 1)
+            if rate >= thr and lvl < end - 1e-6:
+                new = min(end, lvl + float(self.config.get("bin_mass_step_kg", 1.0)))
+                logger.info(
+                    f"bin mass curriculum: {lvl:.2f} -> {new:.2f} kg (tilt success "
+                    f"{rate:.3f} over {self._bin_mass_lvl_eps} TILT episodes)"
+                )
+                self.bin_mass_level_kg = torch.tensor(new, device=self.device)
+                self._bin_mass_lvl_eps = 0
+                self._bin_mass_lvl_succ = 0
+            elif lvl < end - 1e-6:
+                self._bin_mass_lvl_eps //= 2
+                self._bin_mass_lvl_succ //= 2
+        self.log_dict["bin_mass_level_kg"] = self.bin_mass_level_kg.clone()
+        # 2026-10-02 grasp_tilt4: checkpoint marker for bin_mass_level_reset_kg
+        # (log_dict is saved as the env state dict; see load_env_state_dict).
+        reset_kg = self.config.get("bin_mass_level_reset_kg", None)
+        if reset_kg is not None:
+            self.log_dict["bin_mass_level_reset_applied_kg"] = torch.tensor(
+                float(reset_kg), device=self.device
+            )
+        # bin_mass_mean_kg is logged in _apply_bin_mass_curriculum (after the
+        # resetting envs got their new mass; logging it here read the old one).
+        self.log_dict["bin_mass_level_episodes"] = torch.tensor(
+            float(self._bin_mass_lvl_eps), device=self.device
+        )
+        if self._bin_mass_lvl_eps > 0:
+            self.log_dict["bin_mass_level_tilt_success"] = torch.tensor(
+                self._bin_mass_lvl_succ / self._bin_mass_lvl_eps, device=self.device
+            )
+
+    def _apply_bin_mass_curriculum(self, env_ids):
+        """2026-10-01 tilt3 (bin_mass_curriculum, default off): re-sample the
+        bin BODY mass of the resetting envs from U[max(bin_mass_start_kg,
+        level - bin_mass_spread_kg), level] (wheels unchanged) and scale the
+        body inertia by the same ratio, through the bin articulation's PhysX
+        view (CPU tensors; same calls as tilt_feasibility A5). Updates
+        _privileged_bin_mass with the live sampled per-env mass."""
+        if not getattr(self, "_bin_mass_cur", False) or len(env_ids) == 0:
+            return
+        art = self.simulator.scene.articulations["bin"]
+        view = art.root_physx_view
+        if not hasattr(self, "_bin_mass_base"):
+            self._bin_body_bi = list(art.body_names).index("body")
+            self._bin_mass_cpu = view.get_masses().clone()
+            self._bin_inertia_cpu = view.get_inertias().clone()
+            self._bin_mass_base = self._bin_mass_cpu[:, self._bin_body_bi].clone()
+            self._bin_inertia_base = self._bin_inertia_cpu[:, self._bin_body_bi].clone()
+            logger.info(
+                f"bin mass curriculum: base body mass {float(self._bin_mass_base[0]):.2f} kg, "
+                f"bodies {list(art.body_names)}, level {float(self.bin_mass_level_kg):.2f} kg"
+            )
+        lvl = float(self.bin_mass_level_kg)
+        lo = max(
+            float(self.config.get("bin_mass_start_kg", 15.0)),
+            lvl - float(self.config.get("bin_mass_spread_kg", 0.0)),
+        )
+        lo = min(lo, lvl)
+        ids_cpu = env_ids.detach().to("cpu", dtype=torch.long)
+        m = lo + (lvl - lo) * torch.rand(len(ids_cpu))
+        ratio = m / self._bin_mass_base[ids_cpu]
+        self._bin_mass_cpu[ids_cpu, self._bin_body_bi] = m
+        self._bin_inertia_cpu[ids_cpu, self._bin_body_bi] = (
+            self._bin_inertia_base[ids_cpu] * ratio[:, None]
+        )
+        idx = ids_cpu.to(torch.int32)
+        view.set_masses(self._bin_mass_cpu, idx)
+        view.set_inertias(self._bin_inertia_cpu, idx)
+        self._bin_mass_env[env_ids] = m.to(self.device)
+        self._privileged_bin_mass[env_ids] = self._bin_mass_env[env_ids]
+        self._bin_mass_ep_level[env_ids] = lvl
+        self.log_dict["bin_mass_mean_kg"] = self._bin_mass_env.mean()
+
+    @override
     def _reset_tasks_callback(self, env_ids):
+        # 2026-10-01: must run BEFORE super(), which overwrites the
+        # current-episode buffers (max stage / completed) for env_ids.
+        self._record_episode_outcomes(env_ids)
+        self._update_bin_mass_curriculum(env_ids)  # 2026-10-01 tilt3
+        self._update_tilt_rate_curriculum(env_ids)  # 2026-10-03 tilt7
+        self._update_push_distance_curriculum(env_ids)  # 2026-10-03 push2
+        self._update_spawn_dr_curriculum(env_ids)  # 2026-10-06 full3
+        bin_yaw_range_deg = float(self.config.get("spawn_bin_yaw_range_deg", 0.0))
+        if bin_yaw_range_deg > 0.0 and len(env_ids) > 0:
+            max_bin_yaw = math.radians(bin_yaw_range_deg)
+            dyaw = torch_rand_float(
+                -max_bin_yaw, max_bin_yaw, (len(env_ids), 1), device=str(self.device)
+            )[:, 0]
+            self._spawn_bin_yaw_rad[env_ids] = dyaw
+            self.push_axis_world[env_ids, 0] = torch.cos(dyaw)
+            self.push_axis_world[env_ids, 1] = torch.sin(dyaw)
+            self.push_axis_world[env_ids, 2] = 0.0
+        elif len(env_ids) > 0:
+            self._spawn_bin_yaw_rad[env_ids] = 0.0
         super()._reset_tasks_callback(env_ids)
+        self._apply_bin_mass_curriculum(env_ids)  # 2026-10-01 tilt3
+        self._approach_transition_ready_steps[env_ids] = 0
         self._reach_transition_ready_steps[env_ids] = 0
         self._grasp_valid_steps[env_ids] = 0
         self._push_invalid_grasp_steps[env_ids] = 0
         self._left_finger_close_latched[env_ids] = False
         self._right_finger_close_latched[env_ids] = False
+        self._tilt_hold_steps[env_ids] = 0  # 2026-09-29 overhand
+        # 2026-10-03 tilt7: the new episode runs its steady-hold gate with the
+        # current threshold (0-dim tensor broadcast, no host sync).
+        self._tilt_rate_thr_env[env_ids] = self.tilt_gate_max_rate_dps
+        self._push_dist_ep_level[env_ids] = self.target_bin_push_distance_m
+        self._spawn_dr_ep_level[env_ids] = self.spawn_dr_dist_level_m
+        # 2026-09-30 overhand grasp_init: every reset starts un-flagged; the
+        # stage-0 subset may be re-flagged in _reset_robot_states_callback
+        # (staged-reset snapshot envs never pass through that callback).
+        self._grasp_init_mask[env_ids] = False
 
     @override
     def _reset_object_states_callback(self, env_ids):
+        # 2026-09-30 overhand: stage-0 resets never touched the bin before
+        # (only staged snapshot resets write its state), so a pushed / toppled
+        # bin carried over into the next episode. `reset_bin_on_reset`
+        # (default False = old behaviour) puts it back at its default pose;
+        # grasp-init envs always get the default bin pose because the canned
+        # robot pose is composed onto it.
+        if bool(self.config.get("reset_bin_on_reset", False)):
+            bin_ids = env_ids
+        else:
+            bin_ids = env_ids[self._grasp_init_mask[env_ids]]
+        if len(bin_ids) > 0:
+            self._write_bin_default_state(bin_ids)
         self._reset_bin_states(env_ids)
+        if len(bin_ids) > 0:
+            # the sim read-back may lag the write; use the written pose.
+            self._initial_bin_pos_xy[bin_ids] = self._bin_default_root_state(bin_ids)[:, :2]
+            self._initial_bar_pos_xy[bin_ids] = self._bar_mid_xy()[bin_ids]
         return super()._reset_object_states_callback(env_ids)
+
+    # ---- 2026-09-30 overhand: grasp-state init (spec section 6 / B5) ----
+    # A fraction `grasp_init_ratio` (default 0.0 = off) of the envs that reset
+    # into stage 0 instead start directly in TILT, already holding the bar
+    # with the validated overhand claw grasp (th 10 deg, a 0.080, gap 2 mm):
+    #   * bin at its default pose; robot root = the canned bin-relative pose
+    #     composed onto it (same rigid transform -> grasp geometry preserved,
+    #     no independent root noise);
+    #   * all joints from the canned state (legs/waist = the hf4 GRASP frame,
+    #     arms = IK + settled, fingers = settled claw), zero velocity;
+    #     optional `grasp_init_joint_noise` (rad, default 0) on arms+fingers;
+    #   * delta-action accumulator = arm targets / fingers closed / HOMIE
+    #     height+pitch commands of the canned posture, so the first policy
+    #     step does not snap the arms, open the fingers or stand the torso up.
+    # Canned state: grasp_init_path (npz from scratch/robot_claw3.py DUMP=...).
+
+    def _grasp_init_state(self):
+        """Lazy-load the canned grasped state and precompute everything in the
+        env's dof / action spaces."""
+        if getattr(self, "_gi_state", None) is not None:
+            return self._gi_state
+        import numpy as np
+
+        from gr00t.rl.utils.paths import resolve_repo_path
+
+        path = str(resolve_repo_path(str(self.config.get("grasp_init_path"))))
+        assert os.path.isfile(path), f"grasp_init_path not found: {path}"
+        data = np.load(path)
+        names = [str(n) for n in data["joint_names"]]
+        dof_names = list(self.dof_names)
+        missing = [n for n in dof_names if n not in names]
+        assert not missing, f"grasp_init state lacks joints {missing}"
+        perm = [names.index(n) for n in dof_names]
+        dev = self.device
+        # "pulled" (default) = settled after the 2 cm pull test (fingers
+        # hooked behind the bar); "closed" = settled after close + hold,
+        # before the pull (palm ~on its IK target).
+        snap = str(self.config.get("grasp_init_snapshot", "pulled"))
+        q_key, t_key = {
+            "pulled": ("joint_pos", "joint_target"),
+            "closed": ("joint_pos_closed", "joint_target_closed"),
+        }[snap]
+        q = torch.tensor(data[q_key][perm], device=dev, dtype=torch.float32)
+        # Arm TARGETS: "settled" = the settled arm pose (default, no pull
+        # tension), "target" = the commanded IK targets of that snapshot.
+        arm_mode = str(self.config.get("grasp_init_arm_target", "settled"))
+        q_tgt = q.clone()
+        if arm_mode == "target":
+            q_tgt = torch.tensor(data[t_key][perm], device=dev, dtype=torch.float32)
+        scale = float(self.config.robot.control.action_scale)
+        default = self.default_dof_pos[0]
+        # HOMIE command guess for the canned posture (pelvis height, torso
+        # pitch), clipped like HomieBase.step does; overridable.
+        h_cmd = self.config.get("grasp_init_homie_height", None)
+        p_cmd = self.config.get("grasp_init_homie_pitch", None)
+        h_cmd = float(data["homie_height_cmd"]) if h_cmd is None else float(h_cmd)
+        p_cmd = float(data["homie_pitch_cmd"]) if p_cmd is None else float(p_cmd)
+        if self.config.get("clip_homie_command", False):
+            h_cmd = min(max(h_cmd, float(self.config.clip_homie_lower_height_threshold)),
+                        float(self.config.clip_homie_upper_height_threshold))
+            p_cmd = min(max(p_cmd, float(self.config.clip_homie_torso_pitch_lower_threshold)),
+                        float(self.config.clip_homie_torso_pitch_upper_threshold))
+        cmd_scale = float(self.config.homie_command_scale)
+        n_cmd = self._num_homie_commands  # 7: vx vy wz height roll pitch yaw
+        processed = self._default_policy_actions[0].clone()  # full commands + upper actions
+        processed[3] = (h_cmd - float(self.config.obs.homie_default_height)) / cmd_scale
+        processed[5] = p_cmd / cmd_scale
+        n_lower = self._num_lower_dof
+        n_upper_non_prim = self._num_non_primitive_dof - n_lower  # 14 arm dofs
+        for k in range(n_upper_non_prim):
+            j = n_lower + k
+            processed[n_cmd + k] = (q_tgt[j] - default[j]) / scale
+        # 2026-09-30 negative control grasp_init_debug_variant=open: fingers
+        # commanded (and placed, see _reset_robot_states_callback) at p0.
+        finger_act = (
+            self._finger_open_action
+            if self._grasp_init_debug_variant() == "open"
+            else self._finger_closed_action
+        )
+        for k in range(len(self._primitive_action_map)):
+            processed[n_cmd + n_upper_non_prim + k] = finger_act
+        # policy action (= delta accumulator) vector: active command slots.
+        act = processed[self._homie_active_command_index]
+        delta = torch.zeros(len(self._delta_action_indices), device=dev)
+        for di, ai in enumerate(self._delta_action_indices.tolist()):
+            delta[di] = act[ai]
+        clip = float(self.config.get("delta_action_clip", 100.0))
+        assert delta.abs().max() <= clip, "grasp_init delta exceeds delta_action_clip"
+        # whole-body action vector (lower HOMIE dofs + upper actions).
+        lower = (q[:n_lower] - default[:n_lower]) / scale
+        whole_body = torch.cat([lower, processed[n_cmd:]])
+        homie_cmd = processed[:n_cmd] * cmd_scale
+        homie_cmd[3] += float(self.config.obs.homie_default_height)
+        t = float(self.config.get("bin_tilt_target_deg", 15.0))
+        std = float(self.config.get("bin_tilt_back_std_deg", 10.0))
+        self._gi_state = dict(
+            q=q,
+            root_pos_in_bin=torch.tensor(data["root_pos_in_bin"], device=dev, dtype=torch.float32),
+            root_quat_in_bin=torch.tensor(
+                data["root_quat_in_bin_wxyz"], device=dev, dtype=torch.float32
+            ),
+            delta=delta,
+            whole_body=whole_body,
+            homie_cmd=homie_cmd,
+            upright_tilt_potential=math.exp(-((0.0 - t) / std) ** 2),
+        )
+        logger.info(
+            f"grasp_init: loaded {path} (arm targets: {arm_mode}), root_in_bin "
+            f"{data['root_pos_in_bin'].round(4).tolist()}, homie height {h_cmd:.3f} "
+            f"pitch {p_cmd:.3f}, finger hull dist cm "
+            f"{data['finger_hull_dist_cm_pulled'].round(2).tolist()}"
+        )
+        return self._gi_state
+
+    def _grasp_init_debug_variant(self):
+        return str(self.config.get("grasp_init_debug_variant", "") or "")
+
+    def _bin_default_root_state(self, env_ids):
+        """(n, 13) default bin root state in world (pos, quat wxyz, vel = 0)."""
+        bin_art = self.simulator.scene.articulations["bin"]
+        state = bin_art.data.default_root_state[env_ids].clone()
+        state[:, :3] += self.simulator.scene.env_origins[env_ids]
+        if float(self.config.get("spawn_bin_yaw_range_deg", 0.0)) > 0.0 and len(env_ids) > 0:
+            dyaw = self._spawn_bin_yaw_rad[env_ids]
+            z = torch.zeros_like(dyaw)
+            q_yaw = quat_from_euler_xyz(z, z, dyaw)
+            state[:, 3:7] = quat_mul(q_yaw, state[:, 3:7])
+        state[:, 7:] = 0.0
+        return state
+
+    def _write_bin_default_state(self, env_ids):
+        bin_art = self.simulator.scene.articulations["bin"]
+        root = torch.zeros(self.num_envs, 13, device=self.device)
+        root[env_ids] = self._bin_default_root_state(env_ids)
+        self.simulator.set_task_root_state_tensor(env_ids, {"bin": root})
+        n_j = bin_art.num_joints
+        if n_j > 0:
+            jp = torch.zeros(self.num_envs, n_j, device=self.device)
+            jp[env_ids] = bin_art.data.default_joint_pos[env_ids]
+            jv = torch.zeros_like(jp)
+            self.simulator.set_task_dof_state_tensor(
+                env_ids, {"bin": (jp, jv, torch.arange(n_j, device=self.device))}
+            )
+        if float(self.config.get("spawn_bin_yaw_range_deg", 0.0)) > 0.0:
+            for sname in (
+                "left_hand_frame_transformer",
+                "right_hand_frame_transformer",
+                "left_hand_bar_frame_transformer",
+                "right_hand_bar_frame_transformer",
+                "head_target_frame_transformer",
+            ):
+                if sname in self.simulator.scene.sensors:
+                    self.simulator.scene.sensors[sname].update(dt=0.0, force_recompute=True)
+
+    @override
+    def _reset_robot_states_callback(self, env_ids, target_states=None):
+        super()._reset_robot_states_callback(env_ids, target_states)
+        ratio = float(self.config.get("grasp_init_ratio", 0.0))
+        if ratio <= 0.0 or target_states is not None or len(env_ids) == 0:
+            return
+        assert self._tilt_enabled, "grasp_init needs enable_tilt_stage"
+        pick = torch.rand(len(env_ids), device=self.device) < ratio
+        gi = env_ids[pick]
+        if len(gi) == 0:
+            return
+        self._grasp_init_mask[gi] = True
+        st = self._grasp_init_state()
+        n = len(gi)
+        bin_root = self._bin_default_root_state(gi)
+        pos = bin_root[:, :3] + quat_apply(
+            bin_root[:, 3:7], st["root_pos_in_bin"][None].expand(n, 3)
+        )
+        quat = quat_mul(bin_root[:, 3:7], st["root_quat_in_bin"][None].expand(n, 4))
+        self.target_robot_root_states[gi, 0:3] = pos
+        self.target_robot_root_states[gi, 3:7] = quat  # wxyz (isaaclab write)
+        self.target_robot_root_states[gi, 7:13] = 0.0
+        q = st["q"][None].expand(n, -1).clone()
+        noise = float(self.config.get("grasp_init_joint_noise", 0.0))
+        if noise > 0.0:
+            idx = torch.cat(
+                [self._left_arm_dof_idx, self._right_arm_dof_idx, self.finger_dof_idx]
+            )
+            q[:, idx] += noise * torch.randn(n, len(idx), device=self.device)
+        # 2026-09-30 offline negative controls for the wrap gate (default ""
+        # = off): "open" = same arm pose, fingers at p0 (open claw);
+        # "raised" = whole robot raised grasp_init_debug_raise (m, 0.03), so
+        # the palm is that much above its grasp pose, fingers at p1.
+        variant = self._grasp_init_debug_variant()
+        if variant in ("open", "raised"):
+            lp = self._left_p0 if variant == "open" else self._left_p1
+            rp = self._right_p0 if variant == "open" else self._right_p1
+            q[:, self._left_hand_dof_idx] = lp
+            q[:, self._right_hand_dof_idx] = rp
+        if variant == "raised":
+            self.target_robot_root_states[gi, 2] += float(
+                self.config.get("grasp_init_debug_raise", 0.03)
+            )
+        elif variant not in ("", "open"):
+            raise ValueError(f"unknown grasp_init_debug_variant {variant!r}")
+        self.target_robot_dof_state[gi, :, 0] = q
+        self.target_robot_dof_state[gi, :, 1] = 0.0
+
+    def _resting_action_state(self):
+        """2026-10-07 approach_dr2 fix: precompute the delta-action accumulator
+        and whole-body action vector corresponding to `resting_dof_pos` (arms at
+        waist with wrist_roll = +-1.5708 rad, fingers open at p0, HOMIE at
+        default height/zero vel). Without this, DeltaActionBase resets
+        `_delta_actions` to 0.0 (= default_dof_pos = 0.0 on all 14 arm DOFs),
+        which yanks both wrists by 90 deg on Step 1 of every STAGE_APPROACH
+        episode."""
+        if getattr(self, "_rest_act_state", None) is not None:
+            return self._rest_act_state
+        dev = self.device
+        q_rest = torch.tensor(
+            list(self.config.resting_dof_pos), device=dev, dtype=torch.float32
+        )
+        scale = float(self.config.robot.control.action_scale)
+        default = self.default_dof_pos[0]
+        n_cmd = self._num_homie_commands
+        n_lower = self._num_lower_dof
+        n_upper_non_prim = self._num_non_primitive_dof - n_lower  # 14 arm dofs
+        processed = self._default_policy_actions[0].clone()
+        for k in range(n_upper_non_prim):
+            j = n_lower + k
+            processed[n_cmd + k] = (q_rest[j] - default[j]) / scale
+        finger_open_act = -1.0 / scale
+        for k in range(len(self._primitive_action_map)):
+            processed[n_cmd + n_upper_non_prim + k] = finger_open_act
+        act = processed[self._homie_active_command_index]
+        delta = torch.zeros(len(self._delta_action_indices), device=dev)
+        arm_delta_cols = []
+        upper_delta_cols = []
+        for di, ai in enumerate(self._delta_action_indices.tolist()):
+            delta[di] = act[ai]
+            orig_idx = int(self._homie_active_command_index[ai])
+            if n_cmd <= orig_idx < n_cmd + n_upper_non_prim:
+                arm_delta_cols.append(di)
+                upper_delta_cols.append(di)
+            elif orig_idx >= n_cmd + n_upper_non_prim:
+                upper_delta_cols.append(di)
+        lower = (q_rest[:n_lower] - default[:n_lower]) / scale
+        whole_body = torch.cat([lower, processed[n_cmd:]])
+        cmd_scale = float(self.config.homie_command_scale)
+        homie_cmd = processed[:n_cmd] * cmd_scale
+        homie_cmd[3] += float(self.config.obs.homie_default_height)
+        self._rest_act_state = dict(
+            delta=delta,
+            whole_body=whole_body,
+            homie_cmd=homie_cmd,
+            arm_delta_cols=torch.tensor(arm_delta_cols, device=dev, dtype=torch.long),
+            upper_delta_cols=torch.tensor(upper_delta_cols, device=dev, dtype=torch.long),
+        )
+        return self._rest_act_state
+
+    def _apply_resting_action_state(self, s0_ids):
+        st = self._resting_action_state()
+        self._delta_actions[s0_ids] = st["delta"]
+        self._last_delta_actions[s0_ids] = 0.0
+        wb = st["whole_body"]
+        if self.actions.shape[1] == wb.numel():
+            self.actions[s0_ids] = wb
+            self.last_actions[s0_ids] = wb
+            self.actions_after_delay[s0_ids] = wb
+            if hasattr(self, "action_queue"):
+                self.action_queue[s0_ids] = wb
+        self._homie_actions[s0_ids] = wb[: self._num_lower_dof]
+        self._homie_commands[s0_ids] = st["homie_cmd"]
+        self._homie_commands_unclipped[s0_ids] = st["homie_cmd"]
+        self._last_homie_commands[s0_ids] = st["homie_cmd"]
+
+    @override
+    def reset_envs_idx(self, env_ids, target_states=None, target_buf=None):
+        super().reset_envs_idx(env_ids, target_states, target_buf)
+        if len(env_ids) > 0 and bool(self.config.get("reset_delta_actions_to_resting", False)):
+            s0 = env_ids[
+                (self.stage_buf[env_ids] == self.STAGE_APPROACH)
+                & ~self._grasp_init_mask[env_ids]
+            ]
+            if len(s0) > 0:
+                self._apply_resting_action_state(s0)
+        # 2026-09-30 overhand grasp_init: after the base classes put the
+        # stage-0 envs in APPROACH, move the grasp-init subset to TILT and make
+        # every holding-related buffer consistent with the canned grasp.
+        if len(env_ids) > 0:
+            gi = env_ids[self._grasp_init_mask[env_ids]]
+            if len(gi) > 0:
+                self._apply_grasp_init_task_state(gi)
+
+    def _apply_grasp_init_task_state(self, gi):
+        st = self._grasp_init_state()
+        self.set_to_stage(gi, torch.full_like(gi, self.STAGE_TILT))
+        # Delta accumulator = canned arm targets / fingers closed / HOMIE
+        # height+pitch; zero last increment (delta-rate penalty + obs).
+        self._delta_actions[gi] = st["delta"]
+        self._last_delta_actions[gi] = 0.0
+        wb = st["whole_body"]
+        if self.actions.shape[1] == wb.numel():
+            self.actions[gi] = wb
+            self.last_actions[gi] = wb
+            self.actions_after_delay[gi] = wb
+            if hasattr(self, "action_queue"):
+                self.action_queue[gi] = wb
+        self._homie_actions[gi] = wb[: self._num_lower_dof]
+        self._homie_commands[gi] = st["homie_cmd"]
+        self._homie_commands_unclipped[gi] = st["homie_cmd"]
+        self._last_homie_commands[gi] = st["homie_cmd"]
+        # Grasp bookkeeping: gate counted as passed, grip fresh, TILT fresh.
+        self._grasp_valid_steps[gi] = int(self.config.get("grasp_transition_hold_steps", 8))
+        self._push_invalid_grasp_steps[gi] = 0
+        self._tilt_hold_steps[gi] = 0
+        self._left_finger_close_latched[gi] = False
+        self._right_finger_close_latched[gi] = False
+        self._prev_tilt_potential[gi] = st["upright_tilt_potential"]
+        self._initial_bin_pos_xy[gi] = self._bin_default_root_state(gi)[:, :2]
+        self._initial_bar_pos_xy[gi] = self._bar_mid_xy()[gi]
+
+    def _grasp_init_debug_report(self, step, ids):
+        """Offline acceptance printout (grasp_init_debug_steps); logging only."""
+        ovh = self._overhand_finger_terms() if self._overhand_mode() else None
+        ld, rd = self._hand_bar_distances()
+        valid = self._grasp_pose_valid_mask()
+        grip = self._grip_maintained_mask()
+        theta = self._bin_tilt_back_deg()
+        lc, rc = self._finger_closure_fractions()
+        root_z = self.simulator.robot_root_states[:, 2]
+
+        def s(x):
+            x = x[ids].float()
+            return f"mean {x.mean():.4f} min {x.min():.4f} max {x.max():.4f}"
+
+        lines = [
+            f"[grasp_init_debug] episode_step={step} n={len(ids)}",
+            f"  stage==TILT frac {(self.stage_buf[ids] == self.STAGE_TILT).float().mean():.3f}"
+            f"  stages {self.stage_buf[ids].tolist()}",
+            f"  palm->bar dist L {s(ld)} | R {s(rd)}"
+            f"  (grasp_bar_valid_dist {float(self.config.get('grasp_bar_valid_dist', 0.03))})",
+            f"  grasp_pose_valid frac {valid[ids].float().mean():.3f}"
+            f"  grip_maintained frac {grip[ids].float().mean():.3f}",
+            f"  closure L {s(lc)} | R {s(rc)}",
+            f"  bin tilt_back deg {s(theta)}  pelvis z {s(root_z)}",
+        ]
+        # 2026-09-30: palm height above the bar axis (bin frame) + readiness.
+        pdl, pdr = self._palm_bar_deltas_bin()
+        la, ra = self._palm_above_bar_masks()
+        lr, rr = self._finger_close_ready()
+        lines.append(
+            f"  palm dz cm L {s(100 * pdl[:, 2])} | R {s(100 * pdr[:, 2])}"
+            f"  (grasp_palm_min_dz {self._palm_min_dz()}) above L {la[ids].float().mean():.3f}"
+            f" R {ra[ids].float().mean():.3f}  finger_close_ready L {lr[ids].float().mean():.3f}"
+            f" R {rr[ids].float().mean():.3f}"
+        )
+        # 2026-09-30: grasp-point target (grasp_bar_reward_target="grasp_target").
+        lgp, rgp = self._palm_grasp_points()
+        lgt, rgt = self._grasp_point_targets()
+        q_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])
+        tl = quat_apply(q_inv, lgt - self._left_bar_raw_pos())
+        tr = quat_apply(q_inv, rgt - self._right_bar_raw_pos())
+        lines.append(
+            f"  grasp_target dist cm L {s(100 * (lgt - lgp).norm(dim=-1))} | R {s(100 * (rgt - rgp).norm(dim=-1))}"
+            f"  target-bar (bin) cm L y {s(100 * tl[:, 1])} z {s(100 * tl[:, 2])}"
+            f" | R y {s(100 * tr[:, 1])} z {s(100 * tr[:, 2])}"
+        )
+        if ovh is not None:
+            names = ("index", "middle", "thumb")
+            for side, (score, dsurf_tip, dsurf_seg, hand_score, wrapped) in ovh.items():
+                slot, below, thumb_front, prox, dy, dz = self._ovh_last_sub[side]
+                lines.append(
+                    f"  {side}: hand_score {s(hand_score)} wrapped frac "
+                    f"{wrapped[ids].float().mean():.3f} | variants "
+                    + " ".join(
+                        f"{m}={v[ids].mean():.3f}(min {v[ids].min():.3f})"
+                        for m, v in self._ovh_last_variants[side].items()
+                    )
+                )
+                for k, fname in enumerate(names):
+                    lines.append(
+                        f"    {fname:6s} dsurf_seg_cm mean {100 * dsurf_seg[ids, k].mean():.3f} "
+                        f"max {100 * dsurf_seg[ids, k].max():.3f} | dsurf_tip_cm "
+                        f"{100 * dsurf_tip[ids, k].mean():.3f} | score {score[ids, k].mean():.3f}"
+                        f" slot {slot[ids, k].mean():.3f} below {below[ids, k].mean():.3f}"
+                        f" thumb_front {thumb_front[ids, k].mean():.3f} prox {prox[ids, k].mean():.3f}"
+                        f" | tip dy {100 * dy[ids, k].mean():.2f} dz {100 * dz[ids, k].mean():.2f} cm"
+                    )
+        print("\n".join(lines), flush=True)
+
+    def _grasp_init_debug_csv_row(self):
+        """2026-09-30 video aid (grasp_init_debug_csv = path, default off):
+        append one row per step for envs 0..grasp_init_debug_csv_envs-1 with
+        the grasp-gate quantities (burned into / shipped next to the mp4)."""
+        path = str(self.config.get("grasp_init_debug_csv"))
+        n = min(int(self.config.get("grasp_init_debug_csv_envs", 2)), self.num_envs)
+        cols = (
+            "sim_step,env,episode_step,stage,grasp_init,hand_score_L,hand_score_R,"
+            "wrapped_L,wrapped_R,grasp_pose_valid,grip_maintained,palm_bar_dist_L,"
+            "palm_bar_dist_R,closure_L,closure_R,bin_tilt_back_deg,pelvis_z,"
+            "invalid_grasp_steps,reset"
+        )
+        # 2026-09-30 (reach_grasp1 video): extended per-hand diagnostics,
+        # appended after the original columns. Positions in the BIN frame
+        # relative to that hand's bar point (x along the bar, y horizontal
+        # across it: - = behind/lid side, z up); tips = the overhand score's
+        # tip points. palm_rerr = rotation vector (deg) of target^-1 * palm,
+        # in the target frame; palm_fwd / palm_nrm = palm-link +X (finger
+        # direction) and palm-face contact axis, expressed in the bin frame.
+        fingers = ("index", "middle", "thumb")
+        ext = []
+        for s in ("L", "R"):
+            ext += [f"lid_{s}", f"palm_twist_deg_{s}", f"palm_down_align_{s}"]
+            ext += [f"palm_rerr_{a}_{s}" for a in "xyz"]
+            ext += [f"palm_gp_{a}_{s}" for a in "xyz"]
+            ext += [f"palm_fwd_{a}_{s}" for a in "xyz"]
+            ext += [f"palm_nrm_{a}_{s}" for a in "xyz"]
+            for fn in fingers:
+                ext += [
+                    f"{fn}_{k}_{s}"
+                    for k in ("dseg", "tipx", "tipy", "tipz", "slot", "below", "front", "prox", "score")
+                ]
+        # 2026-10-01 (default False): per hand link |F| (N) against the bin,
+        # bin-frame dy/dz from that hand's bar point and the lid-region flag
+        # of _lid_contact_per_hand, to see WHICH links make lid contact.
+        lid_links = bool(self.config.get("grasp_init_debug_csv_lid_links", False))
+        if lid_links:
+            self._init_hand_link_indices()
+            sim_names = list(self.simulator.body_names)
+            for s, side in (("L", "left"), ("R", "right")):
+                for i in self._hand_link_sim_idx[side].tolist():
+                    nm = sim_names[i].replace(f"{side}_hand_", "")
+                    ext += [f"lk_{nm}_{s}_{k}" for k in ("F", "dy", "dz", "inlid")]
+        # 2026-10-01 tilt2 video aid (default False): hand moment about the
+        # wheel contact line (Nm, + tips back), total hand-on-bin |F| (N),
+        # body (non-hand/wrist/foot) bin contact (N) and the physical HOMIE
+        # height / pitch / vx commands (squat + lean observability).
+        tilt_cols = bool(self.config.get("grasp_init_debug_csv_tilt", False))
+        if tilt_cols:
+            ext += ["tilt_moment_Nm", "hand_force_N", "body_bin_contact_N",
+                    "homie_height_cmd", "homie_pitch_cmd", "homie_vx_cmd", "homie_height_cmd_raw",
+                    "bin_mass_kg"]
+            # 2026-10-01 tilt3: normal-only / friction-only hand moments (the
+            # friction ones NaN unless task.target_obj_contact_track_friction)
+            # and the wrist links' contact |F| / moment (not in either sum).
+            ext += ["tilt_moment_normal_Nm", "tilt_moment_fric_Nm", "fric_force_N",
+                    "wrist_contact_N", "wrist_moment_Nm"]
+        # 2026-10-02 tilt5 video aid (default False): bin-mass curriculum level
+        # (global, and the level this env's episode was sampled at), WHOLE-bin
+        # mass (all bin bodies incl. wheels, kg, read back from PhysX) and the
+        # per-link |F| (N) of every link summed by _body_bin_contact_force, to
+        # see WHICH body part (knee/shin vs torso vs elbow) touches the bin.
+        body_links = bool(self.config.get("grasp_init_debug_csv_body_links", False))
+        if body_links:
+            self._body_bin_contact_force()  # builds self._body_contact_idx
+            bl_names = list(self.simulator.body_names)
+            ext += ["bin_level_kg", "bin_ep_level_kg", "bin_total_kg"]
+            ext += [f"bc_{bl_names[i]}" for i in self._body_contact_idx.tolist()]
+        cols = cols + "," + ",".join(ext)
+        if not getattr(self, "_gi_csv_started", False):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(cols + "\n")
+            self._gi_csv_started = True
+            self._gi_csv_step = 0
+        self._gi_csv_step += 1
+        ovh = None
+        if self._overhand_mode():
+            ovh = self._overhand_finger_terms()
+            hs_l, hs_r = ovh["left"][3], ovh["right"][3]
+            w_l, w_r = ovh["left"][4], ovh["right"][4]
+        else:
+            hs_l, hs_r = self._wrap_hand_scores()
+            w_l = w_r = torch.zeros_like(hs_l, dtype=torch.bool)
+        ld, rd = self._hand_bar_distances()
+        valid = self._grasp_pose_valid_mask()
+        grip = self._grip_maintained_mask()
+        lc, rc = self._finger_closure_fractions()
+        theta = self._bin_tilt_back_deg()
+        root_z = self.simulator.robot_root_states[:, 2]
+        # --- extended diagnostics ---
+        lid = self._lid_contact_per_hand()
+        twist = self._palm_twist_errors()
+        align = self._palm_down_alignments()
+        gp = self._palm_grasp_points()
+        contact_axes = self._palm_contact_axes()
+        q_bin_inv = quat_inv(self.simulator.get_task_root_state("bin")[:, 3:7])
+        targets = (
+            xyzw_to_wxyz(self._left_handle_target_rot()),
+            xyzw_to_wxyz(self._right_handle_target_rot()),
+        )
+        ext_vals = []  # list of (N, k) tensors, in column order
+        for h, (side, bar, palm_idx) in enumerate(
+            (
+                ("left", self._left_bar_raw_pos(), self.left_palm_idx),
+                ("right", self._right_bar_raw_pos(), self.right_palm_idx),
+            )
+        ):
+            palm_q = xyzw_to_wxyz(self.simulator._rigid_body_rot[:, palm_idx, :])
+            q_err = quat_mul(quat_inv(targets[h]), palm_q)
+            q_err = torch.where(q_err[:, :1] < 0, -q_err, q_err)
+            v = q_err[:, 1:]
+            vn = v.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+            ang = 2.0 * torch.atan2(vn, q_err[:, :1])
+            rerr = torch.rad2deg(v / vn * ang)
+            gp_b = quat_apply(q_bin_inv, gp[h] - bar)
+            fwd_b = quat_apply(
+                q_bin_inv,
+                quat_apply(palm_q, torch.tensor([[1.0, 0.0, 0.0]], device=self.device).expand(self.num_envs, 3)),
+            )
+            nrm_b = quat_apply(q_bin_inv, quat_apply(palm_q, contact_axes[h]))
+            ext_vals += [
+                lid[h][:, None], torch.rad2deg(twist[h])[:, None], align[h][:, None],
+                rerr, gp_b, fwd_b, nrm_b,
+            ]
+            if ovh is not None:
+                score, _, dseg, _, _ = ovh[side]
+                slot, below, front, prox, _, _ = self._ovh_last_sub[side]
+                tip = self._ovh_last_tip[side]
+                for k in range(3):
+                    ext_vals.append(
+                        torch.stack(
+                            [dseg[:, k], tip[:, k, 0], tip[:, k, 1], tip[:, k, 2],
+                             slot[:, k], below[:, k], front[:, k], prox[:, k], score[:, k]],
+                            dim=-1,
+                        )
+                    )
+            else:
+                ext_vals.append(torch.full((self.num_envs, 27), float("nan"), device=self.device))
+        if lid_links:
+            forces = self.simulator.object_to_hand_contact_forces[:, 0, :, :].norm(dim=-1)
+            dy_max = float(self.config.get("grasp_lid_dy_max", -0.024))
+            dz_min = float(self.config.get("grasp_lid_dz_min", 0.0))
+            for side, bar in (
+                ("left", self._left_bar_raw_pos()),
+                ("right", self._right_bar_raw_pos()),
+            ):
+                d = self._bar_frame_deltas(self._hand_link_sim_idx[side], bar)
+                fl = forces[:, self._hand_link_contact_idx[side]]
+                inl = ((d[..., 1] < dy_max) & (d[..., 2] > dz_min)).float()
+                ext_vals.append(
+                    torch.stack([fl, d[..., 1], d[..., 2], inl], dim=-1).reshape(self.num_envs, -1)
+                )
+        if tilt_cols:
+            m_csv, f_csv = self._bin_tilt_moment_terms()
+            # _homie_commands columns: vx, vy, yaw, height, roll, pitch, yaw_t
+            # (clip_homie_* threshold order in homie_base). height_raw = before
+            # the clip_homie_*_height_threshold clamp (saturation check).
+            hc = self.get_physical_homie_commands()
+            h_raw = self._homie_commands_unclipped[:, 3]
+            # 2026-10-01 tilt3: bin body mass READ BACK from PhysX (checks
+            # that _apply_bin_mass_curriculum's set_masses took effect).
+            art = self.simulator.scene.articulations["bin"]
+            bi = list(art.body_names).index("body")
+            m_rb = art.root_physx_view.get_masses()[:, bi].to(self.device).float()
+            ext_vals.append(
+                torch.stack(
+                    [m_csv, f_csv, self._body_bin_contact_force(), hc[:, 3], hc[:, 5], hc[:, 0], h_raw, m_rb],
+                    dim=-1,
+                )
+            )
+            # 2026-10-01 tilt3: normal-only and friction-only (RAW sign, i.e.
+            # friction_forces_w as reported) hand moments, so both sign
+            # conventions can be checked offline against the static limit.
+            self._init_hand_link_indices()
+            f_n = self.BIN_TILT_MOMENT_FORCE_SIGN * self.simulator.object_to_hand_contact_forces[:, 0, :, :]
+            m_n = self._bin_hand_moment(f_n)
+            fr_raw = getattr(self.simulator, "object_to_hand_friction_forces", None)
+            if fr_raw is not None:
+                fr_raw = fr_raw[:, 0, :, :]
+                m_f = self._bin_hand_moment(fr_raw)
+                f_f = fr_raw.norm(dim=-1).sum(dim=-1)
+            else:
+                m_f = torch.full_like(m_n, float("nan"))
+                f_f = torch.full_like(m_n, float("nan"))
+            w_f, w_m = self._wrist_bin_contact_terms()
+            ext_vals.append(torch.stack([m_n, m_f, f_f, w_f, w_m], dim=-1))
+        if body_links:  # 2026-10-02 tilt5 video aid (same order as the names)
+            lvl_g = float(getattr(self, "bin_mass_level_kg", float("nan")))
+            art_b = self.simulator.scene.articulations["bin"]
+            m_tot = art_b.root_physx_view.get_masses().sum(dim=-1).to(self.device).float()
+            bc = self.simulator.contact_forces[:, self._body_contact_idx, :].norm(dim=-1).float()
+            ext_vals.append(
+                torch.cat(
+                    [
+                        torch.full((self.num_envs, 1), lvl_g, device=self.device),
+                        self._bin_mass_ep_level.float()[:, None],
+                        m_tot[:, None],
+                        bc,
+                    ],
+                    dim=-1,
+                )
+            )
+        ext_t = torch.cat(ext_vals, dim=-1)
+        rows = []
+        for e in range(n):
+            vals = [
+                self._gi_csv_step, e, int(self.episode_length_buf[e]), int(self.stage_buf[e]),
+                int(self._grasp_init_mask[e]), f"{float(hs_l[e]):.4f}", f"{float(hs_r[e]):.4f}",
+                int(w_l[e]), int(w_r[e]), int(valid[e]), int(grip[e]),
+                f"{float(ld[e]):.4f}", f"{float(rd[e]):.4f}", f"{float(lc[e]):.4f}",
+                f"{float(rc[e]):.4f}", f"{float(theta[e]):.3f}", f"{float(root_z[e]):.4f}",
+                int(self._push_invalid_grasp_steps[e]), int(self.reset_buf[e]),
+            ]
+            vals += [f"{x:.4f}" for x in ext_t[e].tolist()]
+            rows.append(",".join(str(v) for v in vals))
+        with open(path, "a") as f:
+            f.write("\n".join(rows) + "\n")
+
+    @override
+    def _compute_reward(self):
+        """2026-10-02 rewcsv: play-analysis aid (grasp_init_debug_csv_rewards =
+        path, default off -> plain super()). Logs the EXACT per-step reward of
+        every term (incl. termination) as the delta of episode_sums across
+        super()._compute_reward(), so no reward function is re-evaluated
+        (potential-based terms such as bin_tilt_progress keep their state).
+        Written here -- after _check_termination, before reset_envs_idx --
+        so reset / timeout / completed and the episode step belong to the same
+        step as the reward (the grasp_init_debug_csv row is written earlier in
+        the step, from _update_custom_logs, and repeated on reset steps)."""
+        path = self.config.get("grasp_init_debug_csv_rewards", None)
+        if not path:
+            return super()._compute_reward()
+        before = {k: v.clone() for k, v in self.episode_sums.items()}
+        out = super()._compute_reward()
+        self._rew_csv_row(str(path), before)
+        return out
+
+    def _rew_csv_row(self, path, before):
+        """2026-10-02 rewcsv: append one row per step for envs
+        0..grasp_init_debug_csv_rewards_envs-1 (fallback grasp_init_debug_csv_envs,
+        then 2): step/stage/termination flags, bin tilt (deg), hand moment
+        (Nm, + tips back, same as the bin_tilt_moment reward), hand |F| (N),
+        grip, tilt-hold counter, sampled bin body mass (kg), r_total (= rew_buf)
+        and r_<term> for every reward term (already x dt and x scale, i.e. the
+        per-step values PPO sees)."""
+        n = min(
+            int(self.config.get(
+                "grasp_init_debug_csv_rewards_envs", self.config.get("grasp_init_debug_csv_envs", 2)
+            )),
+            self.num_envs,
+        )
+        names = list(self.episode_sums.keys())
+        if not getattr(self, "_rew_csv_started", False):
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            head = (
+                "sim_step,env,episode_step,stage,time_in_stage,reset,timeout,completed,"
+                "bin_tilt_back_deg,tilt_moment_Nm,hand_force_N,grip,tilt_hold_steps,bin_mass_kg,r_total"
+            )
+            with open(path, "w") as f:
+                f.write(head + "," + ",".join(f"r_{k}" for k in names) + "\n")
+            self._rew_csv_started = True
+            self._rew_csv_names = names
+            self._rew_csv_step = 0
+        self._rew_csv_step += 1
+        m_t, f_t = self._bin_tilt_moment_terms()
+        cols = [
+            self.episode_length_buf.float(), self.stage_buf.float(), self.time_in_stage_buf.float(),
+            self.reset_buf.float(), self.time_out_buf.float(), self.current_completed_task_buf.float(),
+            self._bin_tilt_back_deg().float(), m_t.float(), f_t.float(),
+            self._grip_maintained_mask().float(), self._tilt_hold_steps.float(),
+            self._bin_mass_env.float(), self.rew_buf.float(),
+        ]
+        cols += [(self.episode_sums[k] - before[k]).float() for k in self._rew_csv_names]
+        vals = torch.stack([c[:n] for c in cols], dim=-1).cpu().tolist()
+        rows = []
+        for e in range(n):
+            v = vals[e]
+            ints = ",".join(str(int(x)) for x in v[:6])
+            rest = ",".join(f"{x:.5g}" for x in v[6:])
+            rows.append(f"{self._rew_csv_step},{e},{ints},{rest}")
+        with open(path, "a") as f:
+            f.write("\n".join(rows) + "\n")
+
+    @override
+    def step(self, actor_state):
+        # 2026-09-30: offline acceptance aid (default False): zero the RL
+        # policy's delta increments so the delta accumulator (arm targets,
+        # fingers, HOMIE height/pitch) holds its reset value; the HOMIE
+        # lower-body actions (last columns) are left untouched.
+        if bool(self.config.get("debug_zero_policy_actions", False)):
+            actor_state["actions"][:, self._delta_action_indices] = 0.0
+        return super().step(actor_state)
 
     def _reset_bin_states(self, env_ids):
         """Populate privileged-info buffers and cache the initial bin XY pose.
@@ -3209,10 +6866,11 @@ class BinPushHomie(
         # bin_pose_progress obs + _stage_3_to_complete_condition.
         bin_xy = self.simulator.get_task_root_state("bin")[env_ids, :2].clone()
         self._initial_bin_pos_xy[env_ids] = bin_xy
+        self._initial_bar_pos_xy[env_ids] = self._bar_mid_xy()[env_ids]
 
-        # Privileged info fallback values (bin mass, ground friction, wheel stiffness).
-        # A follow-up commit will read these from the spawner's per-env DR tape.
-        self._privileged_bin_mass[env_ids] = 15.0
+        # Privileged info values (live per-env bin mass from _bin_mass_env, which
+        # defaults to 15.0 when bin_mass_curriculum is off; ground friction; wheel stiffness).
+        self._privileged_bin_mass[env_ids] = self._bin_mass_env[env_ids]
         self._privileged_ground_friction[env_ids] = 0.9
         self._privileged_wheel_stiffness[env_ids] = 0.5
 
@@ -3221,6 +6879,14 @@ class BinPushHomie(
 
     def _load_initial_bin_pos_xy(self, env_ids, data):
         self._initial_bin_pos_xy[env_ids] = data
+        self._initial_bar_pos_xy[env_ids] = self._bar_mid_xy()[env_ids]
+        if float(self.config.get("spawn_bin_yaw_range_deg", 0.0)) > 0.0 and len(env_ids) > 0:
+            q_bin = self.simulator.get_task_root_state("bin")[env_ids, 3:7]
+            ex = torch.tensor([[1.0, 0.0, 0.0]], device=self.device).expand(len(env_ids), 3)
+            axle_w = quat_apply(q_bin, ex)
+            push_xy = F.normalize(torch.stack([axle_w[:, 1], -axle_w[:, 0]], dim=-1), dim=-1)
+            self.push_axis_world[env_ids, :2] = push_xy
+            self.push_axis_world[env_ids, 2] = 0.0
 
     @override
     def _check_termination(self):
@@ -3229,7 +6895,8 @@ class BinPushHomie(
         not_just_resetted = self.episode_length_buf > 20
 
         # Distance to bin > 5m — robot must be near-ish to the bin.
-        self.reset_buf |= (self.relative_bin_pos_buf.norm(dim=-1) > 5.0) & not_just_resetted
+        too_far = (self.relative_bin_pos_buf.norm(dim=-1) > 5.0) & not_just_resetted
+        self.reset_buf |= too_far
 
         # DOF overspeed (only after settling).
         dof_overspeed = torch.any(
@@ -3240,11 +6907,67 @@ class BinPushHomie(
         self.reset_buf |= dof_overspeed & not_just_resetted
 
         grasp_loss_grace = int(self.config.get("push_grasp_loss_grace_steps", 10))
-        self.reset_buf |= (
-            (self.stage_buf == self.STAGE_PUSH)
+        # 2026-09-29 overhand: grip loss terminates in every grasp-holding
+        # stage (TILT + PUSH; == PUSH only when the TILT stage is disabled).
+        grip_lost = (
+            self._holding_stage_mask()
             & (self._push_invalid_grasp_steps > grasp_loss_grace)
             & not_just_resetted
         )
+        self.reset_buf |= grip_lost
+        task_failed = too_far | (dof_overspeed & not_just_resetted) | grip_lost
+
+        # 2026-09-29 overhand (B6): bin toppled forward / fallen back past its
+        # self-balance angle -> failure (any stage, after settling).
+        if bool(self.config.get("bin_topple_terminate", False)):
+            theta = self._bin_tilt_back_deg()
+            lo = float(self.config.get("bin_topple_min_deg", -8.0))
+            hi = float(self.config.get("bin_topple_max_deg", 30.0))
+            toppled = ((theta < lo) | (theta > hi)) & not_just_resetted
+            self.reset_buf |= toppled
+            task_failed = task_failed | toppled
+        # With overtime_is_timeout, a task failure is never labelled a timeout
+        # even if the stage also ran over this step (old configs: unchanged).
+        if self.config.get("overtime_is_timeout", False):
+            self.time_out_buf &= ~task_failed
+            if not bool(self.config.get("tilt_overtime_is_timeout", True)):
+                # 2026-10-03 push3: running out the 4 s TILT clock without
+                # passing the TILT->PUSH gate is a failure to tilt (not a
+                # harmless timeout), so stalling below 10 deg in TILT cannot
+                # farm an infinite-horizon value bootstrap.
+                tilt_overtime = (
+                    (self.stage_buf == self.STAGE_TILT)
+                    & (self.time_in_stage_buf >= self.max_stage_time[self.stage_buf])
+                    & ~self.just_completed_task_buf
+                )
+                self.time_out_buf &= ~tilt_overtime
+            if not bool(self.config.get("pre_push_overtime_is_timeout", True)):
+                # 2026-10-04 full2: running out the stage clock in any pre-PUSH
+                # stage (APPROACH, REACH, GRASP, TILT) is a failure to advance
+                # (not a bootstrapped timeout), so stalling in REACH or GRASP
+                # cannot farm a free +gamma*V(s) value bootstrap to avoid TILT.
+                final_stage = self.STAGE_PUSH if self._tilt_enabled else 3
+                pre_push_overtime = (
+                    (self.stage_buf < final_stage)
+                    & (self.time_in_stage_buf >= self.max_stage_time[self.stage_buf])
+                    & ~self.just_completed_task_buf
+                )
+                self.time_out_buf &= ~pre_push_overtime
+        # 2026-09-30 offline acceptance aid (only with grasp_init_debug_steps):
+        # report every grasp-init env that terminates and why.
+        if self.config.get("grasp_init_debug_steps", None):
+            term = self._grasp_init_mask & (self.reset_buf | self.time_out_buf)
+            if bool(term.any()):
+                ids = term.nonzero(as_tuple=False).flatten()
+                print(
+                    f"[grasp_init_debug] TERMINATION n={len(ids)} env {ids.tolist()} "
+                    f"ep_len {self.episode_length_buf[ids].tolist()} "
+                    f"grip_lost {grip_lost[ids].int().tolist()} "
+                    f"invalid_steps {self._push_invalid_grasp_steps[ids].tolist()} "
+                    f"timeout {self.time_out_buf[ids].int().tolist()} "
+                    f"stage {self.stage_buf[ids].tolist()}",
+                    flush=True,
+                )
 
     @property
     def ground_height(self):
@@ -3270,12 +6993,23 @@ class BinPushHomie(
         # Dedicated WHEEL contact sensor for penalty_bin_wheel_kick (Run 6 bugfix):
         # the penalty must read only the wheels, not the whole bin body. The bin
         # USD exposes wheel_left / wheel_right rigid bodies (see prepare_bin_asset).
-        bin_wheel_contact_sensor_config = ContactSensorCfg(
-            prim_path=f"/World/envs/env_.*/{simulator.task_config.target_obj}/wheel_.*",
-        )
-        simulator.scene.sensors["bin_wheel_contact_sensor"] = ContactSensor(
-            bin_wheel_contact_sensor_config
-        )
+        # 2026-09-25: filtered to robot knee/ankle links. Unfiltered
+        # net_forces_w included the FLOOR holding the bin up, so the penalty
+        # fired every PUSH step and grew when the bin tipped back onto its wheels.
+        # 2026-09-27 handlefix4: ONE sensor per wheel. A single sensor over
+        # wheel_.* (2 bodies/env) made PhysX reject the per-env leg filters
+        # ("expected 4096, found 2048") -> empty force matrix -> penalty was 0.
+        for wheel in ("wheel_left", "wheel_right"):
+            simulator.scene.sensors[f"bin_{wheel}_contact_sensor"] = ContactSensor(
+                ContactSensorCfg(
+                    prim_path=f"/World/envs/env_.*/{simulator.task_config.target_obj}/{wheel}",
+                    filter_prim_paths_expr=[
+                        f"/World/envs/env_.*/Robot/{side}_{link}"
+                        for side in ("left", "right")
+                        for link in ("knee_link", "ankle_pitch_link", "ankle_roll_link")
+                    ],
+                )
+            )
 
         # Dedicated BAR contact sensors -- ADDED 2026-08-27, REVERTED
         # 2026-08-29. The original motivation was real: `_hand_contact_counts()`
@@ -3359,7 +7093,10 @@ class BinPushHomie(
                     prim_path=f"/World/envs/env_.*/{obj}/grasp_target_right",
                     offset=OffsetCfg(
                         pos=target_position_offset,
-                        rot=(0.70710678, 0.0, -0.70710678, 0.0)
+                        # 2026-09-28 handlefix5: configurable (front hook).
+                        rot=tuple(self.config.get(
+                            "grasp_target_rot_left",
+                            [0.70710678, 0.0, -0.70710678, 0.0])),
                     ),
                 ),
             ],
@@ -3374,7 +7111,9 @@ class BinPushHomie(
                     prim_path=f"/World/envs/env_.*/{obj}/grasp_target_left",
                     offset=OffsetCfg(
                         pos=target_position_offset,
-                        rot=(0.0, -0.70710678, 0.0, -0.70710678)
+                        rot=tuple(self.config.get(
+                            "grasp_target_rot_right",
+                            [0.0, -0.70710678, 0.0, -0.70710678])),
                     ),
                 ),
             ],
